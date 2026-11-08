@@ -3,8 +3,23 @@ name: Craft Apps Web Builds
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "AGENTS.md"
+      - "README.md"
+      - "docs/**"
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to attach the combined suite asset to (e.g. v0.1.0)"
+        required: false
+        default: ""
+        type: string
+      source_run_id:
+        description: "Existing workflow run ID to pull wasm-suite artifact from without rebuilding"
+        required: false
+        default: ""
+        type: string
   # Rebuild periodically because the app source repositories are separate.
   schedule:
     - cron: "17 3 * * *"
@@ -19,6 +34,7 @@ concurrency:
 jobs:
   verify-universal-bridge:
     name: Verify universal Rust bridge crate
+    if: ${{ inputs.source_run_id == '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out craft-web-builds
@@ -100,6 +116,7 @@ jobs:
   build:
     name: Build ${{ matrix.app.id }}
     needs: verify-universal-bridge
+    if: ${{ inputs.source_run_id == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -295,6 +312,7 @@ jobs:
   combine:
     name: Combine app packages
     needs: build
+    if: ${{ inputs.source_run_id == '' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -323,3 +341,55 @@ jobs:
       - name: Report artifact
         run: |
           echo "Suite artifact ID: ${{ steps.upload.outputs.artifact-id }}" >> "$GITHUB_STEP_SUMMARY"
+
+  attach-release-asset:
+    name: Attach combined suite asset to release ${{ inputs.release_tag }}
+    needs: combine
+    if: ${{ always() && inputs.release_tag != '' && (inputs.source_run_id != '' || needs.combine.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download combined suite artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wasm-suite-*
+          path: dist/suite
+          merge-multiple: true
+          run-id: ${{ inputs.source_run_id != '' && inputs.source_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package main combined asset and upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMBINED_ZIP="wasm-suite-${RELEASE_TAG}.zip"
+          (cd dist/suite && zip -qr0 "$RUNNER_TEMP/$COMBINED_ZIP" .)
+          ls -lh "$RUNNER_TEMP/$COMBINED_ZIP"
+
+          REL_ID="$(gh api "/repos/${REPO}/releases" --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\") | .id" | head -n 1)"
+          if [[ -z "$REL_ID" ]]; then
+            echo "error: release ${RELEASE_TAG} not found" >&2
+            exit 1
+          fi
+
+          # Remove any existing asset with the same name so re-runs are idempotent
+          EXISTING_ASSET_ID="$(gh api "/repos/${REPO}/releases/${REL_ID}/assets" --jq ".[] | select(.name == \"${COMBINED_ZIP}\") | .id" | head -n 1)"
+          if [[ -n "$EXISTING_ASSET_ID" ]]; then
+            gh api -X DELETE "/repos/${REPO}/releases/assets/${EXISTING_ASSET_ID}"
+          fi
+
+          curl --proto '=https' -fsSL --retry 3 \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/zip" \
+            --data-binary @"$RUNNER_TEMP/$COMBINED_ZIP" \
+            "https://uploads.github.com/repos/${REPO}/releases/${REL_ID}/assets?name=${COMBINED_ZIP}" \
+            | jq '{id, name, size, state, browser_download_url}'
+
