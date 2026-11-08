@@ -62,10 +62,25 @@ for (const arg of process.argv.slice(2)) {
   }
 }
 
+function resolveChromePath(explicit) {
+  if (explicit && fs.existsSync(explicit)) return explicit;
+  for (const candidate of [
+    '/usr/local/bin/chrome-headless-shell',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+  ]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return explicit || '/usr/local/bin/chrome-headless-shell';
+}
+
 const ROOT = path.resolve(flags.root || process.env.CRAFT_SUITE_ROOT || '.');
-const CHROME_PATH = flags.chrome || process.env.CHROME_PATH || '/usr/local/bin/chrome-headless-shell';
+const CHROME_PATH = resolveChromePath(flags.chrome || process.env.CHROME_PATH);
 const OUT_PATH = path.resolve(flags.out || path.join(ROOT, 'v2-results.json'));
 const SCREENSHOTS_DIR = flags['screenshots-dir'] ? path.resolve(flags['screenshots-dir']) : null;
+const STRICT = flags.strict === 'true';
 
 if (SCREENSHOTS_DIR) {
   fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
@@ -281,9 +296,16 @@ for (const slug of APPS) {
     }
     console.log(`[PASS] ${slug}:`, JSON.stringify(res));
     existing[slug] = res;
+    if (STRICT && (!res.commandsOk || !res.inspectOk || !res.snapshotOk || res.globalIsCanvas)) {
+      console.error(`[FAIL-STRICT] ${slug} failed verification checks`);
+      process.exitCode = 1;
+    }
   } catch (err) {
     console.log(`[ERR] ${slug}:`, err.message);
     existing[slug] = { app: slug, error: err.message };
+    if (STRICT) {
+      process.exitCode = 1;
+    }
   } finally {
     await page.close();
   }

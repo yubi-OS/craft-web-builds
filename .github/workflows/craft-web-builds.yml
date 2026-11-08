@@ -301,6 +301,27 @@ jobs:
               bridge_version: $bridge_version
             }' > "$OUT/$APP_ID.json"
 
+      - name: Verify WebAssembly package in headless Chrome (Puppeteer)
+        env:
+          APP_ID: ${{ matrix.app.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/web-artifact/$APP_ID"
+          VERIFY_JSON="$RUNNER_TEMP/puppeteer-verify-${APP_ID}.json"
+          mkdir -p "$RUNNER_TEMP/puppeteer"
+          npm install --no-save --silent --prefix "$RUNNER_TEMP/puppeteer" puppeteer-core
+          NODE_PATH="$RUNNER_TEMP/puppeteer/node_modules" \
+            node "$RUNNER_TEMP/craft-web-builds/scripts/puppeteer/verify-suite.mjs" \
+            --root="$OUT" \
+            --out="$VERIFY_JSON" \
+            --strict \
+            "$APP_ID"
+          jq -s '.[0] + { puppeteer: .[1][$app] }' --arg app "$APP_ID" \
+            "$OUT/$APP_ID.json" "$VERIFY_JSON" > "$OUT/$APP_ID.json.tmp"
+          mv "$OUT/$APP_ID.json.tmp" "$OUT/$APP_ID.json"
+          cat "$OUT/$APP_ID.json"
+
       - name: Upload app package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
