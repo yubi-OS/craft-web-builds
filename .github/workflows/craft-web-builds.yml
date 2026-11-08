@@ -351,25 +351,25 @@ jobs:
       contents: write
       actions: read
     steps:
-      - name: Download combined suite artifact
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: wasm-suite-*
-          path: dist/suite
-          merge-multiple: true
-          run-id: ${{ inputs.source_run_id != '' && inputs.source_run_id || github.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Package main combined asset and upload to release
+      - name: Download exact combined suite artifact zip and upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_RUN_ID: ${{ inputs.source_run_id != '' && inputs.source_run_id || github.run_id }}
           REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           COMBINED_ZIP="wasm-suite-${RELEASE_TAG}.zip"
-          (cd dist/suite && zip -qr0 "$RUNNER_TEMP/$COMBINED_ZIP" .)
+
+          ART_ID="$(gh api "/repos/${REPO}/actions/runs/${TARGET_RUN_ID}/artifacts?per_page=30" \
+            --jq '.artifacts[] | select(.name | startswith("wasm-suite-")) | .id' | head -n 1)"
+          if [[ -z "$ART_ID" ]]; then
+            echo "error: wasm-suite-* artifact not found on run ${TARGET_RUN_ID}" >&2
+            exit 1
+          fi
+
+          gh api "/repos/${REPO}/actions/artifacts/${ART_ID}/zip" > "$RUNNER_TEMP/$COMBINED_ZIP"
           ls -lh "$RUNNER_TEMP/$COMBINED_ZIP"
 
           REL_ID="$(gh api "/repos/${REPO}/releases" --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\") | .id" | head -n 1)"
