@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import tomllib
 
 app_id, app_root, web_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 cargo_path = os.path.join(web_dir, "Cargo.toml")
@@ -12,29 +13,59 @@ with open(cargo_path, "r", encoding="utf-8") as f:
 with open(root_cargo_path, "r", encoding="utf-8") as f:
     root_text = f.read()
 
-has_ws_serde = bool(re.search(r"^serde\s*=", root_text, re.M))
-has_ws_serde_json = bool(re.search(r"^serde_json\s*=", root_text, re.M))
+root_toml = tomllib.loads(root_text)
+ws_deps = root_toml.get("workspace", {}).get("dependencies", {})
 
-def ensure_dep(toml_text: str, section: str, crate: str, spec: str) -> str:
-    if re.search(rf"^{re.escape(crate)}\s*=", toml_text, re.M):
-        return toml_text
-    header = f"[{section}]"
-    if header in toml_text:
-        return toml_text.replace(header, f"{header}\n{crate} = {spec}", 1)
-    return toml_text + f"\n{header}\n{crate} = {spec}\n"
+def spec_for(crate: str, fallback: str) -> str:
+    if crate in ws_deps:
+        if crate == "serde":
+            return '{ workspace = true, features = ["derive"] }'
+        return "{ workspace = true }"
+    return fallback
 
-serde_spec = '{ workspace = true }' if has_ws_serde else '{ version = "1", features = ["derive"] }'
-serde_json_spec = '{ workspace = true }' if has_ws_serde_json else '"1"'
+def insert_into_section(toml_text: str, section_header: str, crate: str, spec: str) -> str:
+    lines = toml_text.splitlines(True)
+    header_line = f"[{section_header}]"
+    for i, line in enumerate(lines):
+        if line.strip() == header_line:
+            lines.insert(i + 1, f"{crate} = {spec}\n")
+            return "".join(lines)
+    return toml_text.rstrip() + f"\n\n[{section_header}]\n{crate} = {spec}\n"
+
+def has_runtime_dep(parsed: dict, crate: str) -> bool:
+    if crate in parsed.get("dependencies", {}):
+        return True
+    for t_cfg, t_tbl in parsed.get("target", {}).items():
+        if "wasm32" in t_cfg and crate in t_tbl.get("dependencies", {}):
+            return True
+    return False
+
+parsed = tomllib.loads(text)
 target_sec = 'target.\'cfg(target_arch = "wasm32")\'.dependencies'
+base_sec = target_sec if app_id in ("filmcraft", "soundcraft") else "dependencies"
 
-if app_id in ("filmcraft", "soundcraft"):
-    text = ensure_dep(text, target_sec, "serde", serde_spec)
-    text = ensure_dep(text, target_sec, "serde_json", serde_json_spec)
-    text = ensure_dep(text, target_sec, "js-sys", '"0.3"')
-else:
-    text = ensure_dep(text, "dependencies", "serde", serde_spec)
-    text = ensure_dep(text, "dependencies", "serde_json", serde_json_spec)
-    text = ensure_dep(text, target_sec, "js-sys", '"0.3"')
+for crate, fallback, sec in [
+    ("serde", '{ version = "1", features = ["derive"] }', base_sec),
+    ("serde_json", '"1"', base_sec),
+    ("wasm-bindgen", '"0.2"', target_sec),
+    ("wasm-bindgen-futures", '"0.4"', target_sec),
+    ("js-sys", '"0.3"', target_sec),
+]:
+    if not has_runtime_dep(parsed, crate):
+        text = insert_into_section(text, sec, crate, spec_for(crate, fallback))
+        parsed = tomllib.loads(text)
+    elif crate == "serde":
+        # Ensure serde has features = ["derive"] enabled
+        serde_entry = parsed.get("dependencies", {}).get("serde") or parsed.get("target", {}).get('cfg(target_arch = "wasm32")', {}).get("dependencies", {}).get("serde")
+        if isinstance(serde_entry, dict) and "features" not in serde_entry:
+            text = re.sub(
+                r"^serde\s*=\s*\{\s*workspace\s*=\s*true\s*\}",
+                'serde = { workspace = true, features = ["derive"] }',
+                text,
+                count=1,
+                flags=re.M,
+            )
+            parsed = tomllib.loads(text)
 
 with open(cargo_path, "w", encoding="utf-8") as f:
     f.write(text)
