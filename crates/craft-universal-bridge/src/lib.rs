@@ -2358,12 +2358,9 @@ mod tests {
         let center_idx = (16 * 32 + 16) * 4;
         assert_eq!(&rgba[center_idx..center_idx + 4], &[0xff, 0x00, 0x00, 0xff]);
 
-        let encoded = base64_encode(b"PNG
-
-hello");
+        let sample: &[u8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', b'h', b'e', b'l', b'l', b'o'];
+        let encoded = base64_encode(sample);
         let decoded = base64_decode(&encoded).unwrap_or_default();
-        assert_eq!(decoded, b"PNG
-
-hello");
+        assert_eq!(decoded, sample);
     }
 }
