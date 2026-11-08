@@ -204,9 +204,22 @@ jobs:
           fi
           sudo install -m 0755 "$STAGE/bin/trunk" /usr/local/bin/trunk
           sudo install -m 0755 "$STAGE/bin/wasm-bindgen" /usr/local/bin/wasm-bindgen
-          sudo install -m 0755 "$STAGE/bin/wasm-opt" /usr/local/bin/wasm-opt
+          sudo install -m 0755 "$STAGE/bin/wasm-opt" /usr/local/bin/wasm-opt.real
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'if /usr/local/bin/wasm-opt.real --help 2>&1 | grep -q -- "--enable-bulk-memory-opt"; then' \
+            '  exec /usr/local/bin/wasm-opt.real "$@"' \
+            'fi' \
+            'ARGS=()' \
+            'for arg in "$@"; do' \
+            '  [[ "$arg" == "--enable-bulk-memory-opt" ]] && continue' \
+            '  ARGS+=("$arg")' \
+            'done' \
+            'exec /usr/local/bin/wasm-opt.real "${ARGS[@]}"' | sudo tee /usr/local/bin/wasm-opt > /dev/null
+          sudo chmod 0755 /usr/local/bin/wasm-opt
           mkdir -p "$HOME/.cache/trunk"
           cp -R "$STAGE/trunk-cache/." "$HOME/.cache/trunk/"
+          sudo cp /usr/local/bin/wasm-opt "$HOME/.cache/trunk/wasm-opt-version_123/bin/wasm-opt"
           chmod -R u+rwx "$HOME/.cache/trunk"
           trunk --version
           wasm-bindgen --version
