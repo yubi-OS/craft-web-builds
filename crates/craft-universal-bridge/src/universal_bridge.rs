@@ -2324,11 +2324,8 @@ pub mod web {
     /// Call `HTMLCanvasElement.prototype.captureStream(fps)` on the app's primary canvas element.
     fn canvas_capture_stream(canvas_id: &str, fps: Option<f64>) -> Result<JsValue, JsValue> {
         let canvas = find_canvas(canvas_id).ok_or_else(|| js_sys::Error::new("app canvas not found"))?;
-        let proto_fn = canvas
-            .dyn_ref::<js_sys::Object>()
-            .map(js_sys::Object::get_prototype_of)
-            .and_then(|proto| get_prop(&proto.into(), "captureStream"))
-            .filter(|v| v.is_function());
+        let proto: JsValue = js_sys::Object::get_prototype_of(&canvas).into();
+        let proto_fn = get_prop(&proto, "captureStream").filter(|v| v.is_function());
         let f: js_sys::Function = proto_fn
             .or_else(|| get_prop(&canvas, "captureStream"))
             .ok_or_else(|| js_sys::Error::new("canvas.captureStream is not supported in this browser"))?
