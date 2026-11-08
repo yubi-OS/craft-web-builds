@@ -1,0 +1,237 @@
+name: Craft Apps Web Builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      app_filter:
+        description: "Optional single app id to build (empty: all 16 apps)"
+        required: false
+        default: ""
+  # Rebuild periodically because the app source repositories are separate.
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-suite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-universal-bridge:
+    name: Verify universal Rust bridge crate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out craft-web-builds
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust and WebAssembly target
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Run native unit tests and clippy on craft-universal-bridge
+        run: |
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo check --workspace --target wasm32-unknown-unknown
+
+  build:
+    name: Build ${{ matrix.app.id }}
+    needs: verify-universal-bridge
+    if: ${{ github.event.inputs.app_filter == '' || github.event.inputs.app_filter == matrix.app.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        app:
+          - { id: photocraft,     repo: photocraft,     web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: vectorcraft,    repo: vectorcraft,    web_fonts: true,  craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: lightcraft,     repo: lightcraft,     web_fonts: true,  craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: pdfcraft,       repo: pdfcraft,       web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: effectcraft,    repo: effectcraft,    web_fonts: false, craft_fonts_ref: "bfcbf714e45a3ea8e98f88ab2b7971372a576414" }
+          - { id: designcraft,    repo: designcraft,    web_fonts: true,  craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: figcraft,       repo: figcraft,       web_fonts: true,  craft_fonts_ref: "37827adc41fd165f9a9234ac40f94dbad353aa69" }
+          - { id: filmcraft,      repo: filmcraft,      web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: texturecraft,   repo: texturecraft,   web_fonts: true,  craft_fonts_ref: "aced4137c022f1f587624d48e81ec77e1914a9cc" }
+          - { id: materialcraft,  repo: materialcraft,  web_fonts: true,  craft_fonts_ref: "3d9ab3a132ed0eff457e424226a435a901da30d3" }
+          - { id: wordcraft,      repo: wordcraft,      web_fonts: true,  craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: soundcraft,     repo: soundcraft,     web_fonts: false, craft_fonts_ref: "bfcbf714e45a3ea8e98f88ab2b7971372a576414" }
+          - { id: deckcraft,      repo: deckcraft,      web_fonts: false, craft_fonts_ref: "37827adc41fd165f9a9234ac40f94dbad353aa69" }
+          - { id: cadcraft,       repo: cadcraft,       web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: gridcraft,      repo: gridcraft,      web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: craft-anything, repo: craft-anything, web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+
+    steps:
+      - name: Check out craft-web-builds overlay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _overlay
+
+      - name: Stage overlay into runner temp
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/craft-web-builds"
+          mv _overlay "$RUNNER_TEMP/craft-web-builds"
+
+      - name: Check out app source (storytold/${{ matrix.app.repo }})
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/${{ matrix.app.repo }}
+          ref: main
+          fetch-depth: 1
+
+      - name: Check out craft-i18n when craft-i18n.rev is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f craft-i18n.rev ]]; then
+            REV="$(tr -d '[:space:]' < craft-i18n.rev)"
+            git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
+            (cd "$GITHUB_WORKSPACE/craft-i18n" && git fetch --depth 1 origin "$REV" && git checkout "$REV")
+            echo "CRAFT_I18N_DIR=$GITHUB_WORKSPACE/craft-i18n" >> "$GITHUB_ENV"
+            echo "CRAFT_I18N_REQUIRED=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check out craft-fonts when web_fonts is enabled
+        if: matrix.app.web_fonts
+        shell: bash
+        env:
+          FONTS_REF: ${{ matrix.app.craft_fonts_ref }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/storytold/craft-fonts.git "$GITHUB_WORKSPACE/craft-fonts"
+          (cd "$GITHUB_WORKSPACE/craft-fonts" && git fetch --depth 1 origin "$FONTS_REF" && git checkout "$FONTS_REF")
+          echo "CRAFT_FONTS_DIR=$GITHUB_WORKSPACE/craft-fonts" >> "$GITHUB_ENV"
+          echo "CRAFT_FONTS_REQUIRED=1" >> "$GITHUB_ENV"
+
+      - name: Apply universal Rust bridge insert and patch series
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/craft-web-builds/scripts/apply-universal-bridge.sh" "${{ matrix.app.id }}" "$GITHUB_WORKSPACE"
+
+      - name: Install Rust and WebAssembly target
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ${{ matrix.app.id }}
+
+      - name: Install Trunk
+        shell: bash
+        run: |
+          set -euo pipefail
+          TRUNK_VERSION=0.21.14
+          ASSET="trunk-x86_64-unknown-linux-musl.tar.gz"
+          BASE="https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}"
+
+          cd "$RUNNER_TEMP"
+          curl --proto '=https' -fsSL --retry 3 "$BASE/$ASSET" -o "$ASSET"
+          curl --proto '=https' -fsSL --retry 3 "$BASE/$ASSET.sha256" -o "$ASSET.sha256"
+          printf '%s  %s\n' "$(cat "$ASSET.sha256")" "$ASSET" | sha256sum --check -
+          tar -xzf "$ASSET" trunk
+          sudo install -m 0755 trunk /usr/local/bin/trunk
+          trunk --version
+
+      - name: Export app build metadata
+        env:
+          APP_ID: ${{ matrix.app.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="$(printf '%s' "$APP_ID" | tr '[:lower:]-' '[:upper:]_')"
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          BUILD_DATE="$(date -u +%F)"
+          echo "${PREFIX}_BUILD_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
+          echo "${PREFIX}_BUILD_DATE=${BUILD_DATE}" >> "$GITHUB_ENV"
+
+      - name: Build and package web app
+        run: packaging/web/package.sh
+
+      - name: Stage package, unpacked site, and build metadata
+        env:
+          APP_ID: ${{ matrix.app.id }}
+          APP_REPO: storytold/${{ matrix.app.repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$(find dist/release -maxdepth 1 -type f -name '*-web-*.zip' -print -quit)"
+          test -n "$ZIP"
+
+          OUT="$RUNNER_TEMP/web-artifact/$APP_ID"
+          mkdir -p "$OUT/site"
+          cp "$ZIP" "$OUT/"
+          unzip -q "$ZIP" -d "$OUT/site"
+
+          INDEX="$(find "$OUT/site" -type f -name index.html -print -quit)"
+          test -n "$INDEX"
+
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          jq -n \
+            --arg app "$APP_ID" \
+            --arg repo "$APP_REPO" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg package "$(basename "$ZIP")" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg bridge_version "universal/1" \
+            '{
+              app: $app,
+              repo: $repo,
+              source_sha: $source_sha,
+              package: $package,
+              workflow_sha: $workflow_sha,
+              bridge_version: $bridge_version
+            }' > "$OUT/$APP_ID.json"
+
+      - name: Upload app package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-${{ matrix.app.id }}
+          path: ${{ runner.temp }}/web-artifact/${{ matrix.app.id }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  combine:
+    name: Combine app packages
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all app artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: web-*
+          path: dist/all
+          merge-multiple: true
+
+      - name: Create manifest
+        run: |
+          set -euo pipefail
+          jq -s 'sort_by(.app)' dist/all/*.json > dist/all/manifest.json
+          ls -lh dist/all/
+
+      - name: Upload complete suite
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasm-suite-${{ github.sha }}
+          path: dist/all/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report artifact
+        run: echo "Suite artifact ID: ${{ steps.upload.outputs.artifact-id }}" >> "$GITHUB_STEP_SUMMARY"
