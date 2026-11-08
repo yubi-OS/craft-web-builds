@@ -1,22 +1,35 @@
-From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
-From: OMNI-AGENT <foil-copy-overrate@duck.com>
-Date: Sun, 8 Nov 2026 07:35:00 +0000
-Subject: [PATCH] feat(photocraft-web): insert universal_bridge.rs (base aae9b7ea6119)
-
-Target repo: storytold/photocraft @ aae9b7ea61195eba0c43877d59654aefdc7c5576
-Wiring mode: channel (photocraft_ui_egui::ControlRequest)
----
- apps/photocraft-web/src/universal_bridge.rs | 2370 ++++++++++++++++
- apps/photocraft-web/src/main.rs | 4 ++++
- 2 files changed, 2374 insertions(+)
- create mode 100644 apps/photocraft-web/src/universal_bridge.rs
-
+diff --git a/apps/photocraft-web/Cargo.toml b/apps/photocraft-web/Cargo.toml
+index 1811aea..9b30c15 100644
+--- a/apps/photocraft-web/Cargo.toml
++++ b/apps/photocraft-web/Cargo.toml
+@@ -19,6 +19,8 @@ name = "photocraft-web"
+ path = "src/main.rs"
+ 
+ [dependencies]
++serde_json = { workspace = true }
++serde = { workspace = true, features = ["derive"] }
+ photocraft-engine = { workspace = true }
+ photocraft-io = { workspace = true }
+ photocraft-codecs = { workspace = true }
+diff --git a/apps/photocraft-web/src/main.rs b/apps/photocraft-web/src/main.rs
+index 6084619..3801387 100644
+--- a/apps/photocraft-web/src/main.rs
++++ b/apps/photocraft-web/src/main.rs
+@@ -18,6 +18,8 @@
+ 
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+ 
++#[cfg(any(target_arch = "wasm32", test))]
++pub mod universal_bridge;
+ #[cfg(any(target_arch = "wasm32", test))]
+ mod diagnostics;
+ 
 diff --git a/apps/photocraft-web/src/universal_bridge.rs b/apps/photocraft-web/src/universal_bridge.rs
 new file mode 100644
-index 0000000..2222222
+index 0000000..05e8721
 --- /dev/null
 +++ b/apps/photocraft-web/src/universal_bridge.rs
-@@ -0,0 +1,2370 @@
+@@ -0,0 +1,2521 @@
 +#![forbid(unsafe_code)]
 +#![deny(
 +    clippy::unwrap_used,
@@ -969,6 +982,16 @@ index 0000000..2222222
 +    } else if let Some(obj) = out.as_object_mut() {
 +        if obj.get("result").is_some_and(Value::is_array) {
 +            obj.get_mut("result").and_then(Value::as_array_mut)
++        } else if obj
++            .get("result")
++            .and_then(Value::as_object)
++            .and_then(|r| r.get("commands"))
++            .is_some_and(Value::is_array)
++        {
++            obj.get_mut("result")
++                .and_then(Value::as_object_mut)
++                .and_then(|r| r.get_mut("commands"))
++                .and_then(Value::as_array_mut)
 +        } else if obj.get("commands").is_some_and(Value::is_array) {
 +            obj.get_mut("commands").and_then(Value::as_array_mut)
 +        } else {
@@ -1183,6 +1206,8 @@ index 0000000..2222222
 +        pub exam_locked: Rc<Cell<bool>>,
 +        pub open_cb: OpenCallback,
 +        pub save_trigger_cb: SaveTriggerCallback,
++        pub waker: Rc<RefCell<Option<Box<dyn Fn()>>>>,
++        in_flight: Rc<Cell<usize>>,
 +        last_dirty_reported: Rc<Cell<Option<bool>>>,
 +    }
 +
@@ -1296,12 +1321,20 @@ index 0000000..2222222
 +                exam_locked: Rc::new(Cell::new(query_value(&query, "exam") == Some("1"))),
 +                open_cb: Rc::default(),
 +                save_trigger_cb: Rc::default(),
++                waker: Rc::default(),
++                in_flight: Rc::new(Cell::new(0)),
 +                last_dirty_reported: Rc::new(Cell::new(None)),
 +            };
 +
 +            let _ = bridge.install_window_api();
 +            bridge.install_host_listener();
 +            bridge
++        }
++
++        /// Register an explicit UI repaint waker (`|| ctx.request_repaint()`) invoked whenever
++        /// a control request is waiting for the `eframe` loop to run a pass.
++        pub fn set_waker(&self, f: impl Fn() + 'static) {
++            *self.waker.borrow_mut() = Some(Box::new(f));
 +        }
 +
 +        /// Register how incoming `open { name, bytes, fonts }` messages hand files to the app.
@@ -1387,7 +1420,9 @@ index 0000000..2222222
 +            }
 +        }
 +
-+        /// Execute any JSON control request `(method, params)` through the app's control channel.
++        /// Execute any JSON control request `(method, params)` through the app's control channel,
++        /// automatically waking the `eframe` runner across 1-frame and multi-frame (`ui.screenshot`)
++        /// operations and normalizing the reply envelope.
 +        pub async fn call_control(&self, method: &str, params: Value) -> Value {
 +            if self.exam_locked.get() && method == self.profile.methods.execute.unwrap_or("engine.execute") {
 +                let cmd = params
@@ -1402,11 +1437,67 @@ index 0000000..2222222
 +                    });
 +                }
 +            }
-+            let reply = (self.request_fn)(method.to_string(), params).await;
++
++            let prev_flight = self.in_flight.get();
++            self.in_flight.set(prev_flight.saturating_add(1));
++            if prev_flight == 0 {
++                let flight = self.in_flight.clone();
++                let waker = self.waker.clone();
++                let canvas_id = self.profile.canvas_id;
++                spawn_local(async move {
++                    let mut step: u32 = 0;
++                    while flight.get() > 0 {
++                        if let Some(w) = waker.borrow().as_ref() {
++                            w();
++                        }
++                        wake_canvas(canvas_id, step);
++                        step = step.wrapping_add(1);
++                        sleep_ms(POLL_MS).await;
++                    }
++                });
++            }
++
++            let raw_reply = (self.request_fn)(method.to_string(), params).await;
++            self.in_flight.set(self.in_flight.get().saturating_sub(1));
++
++            let reply = normalize_control_reply(raw_reply);
 +            if method == self.profile.methods.execute.unwrap_or("engine.execute")
 +                && reply.get("ok").and_then(Value::as_bool) == Some(true)
 +            {
 +                self.revision.borrow_mut().record_edit();
++            }
++            reply
++        }
++
++        /// Inspect document state (`doc_inspect`), automatically adapting when `document.inspect`
++        /// is an engine command (as in PhotoCraft) or falling back to `ui.inspect` when no document
++        /// is open yet.
++        pub async fn call_doc_inspect(&self, params: Value) -> Value {
++            let doc_method = self
++                .profile
++                .methods
++                .doc_inspect
++                .or(self.profile.methods.ui_inspect)
++                .unwrap_or("ui.inspect");
++            let mut reply = self.call_control(doc_method, params.clone()).await;
++            if reply.get("ok").and_then(Value::as_bool) == Some(false) {
++                let err_lower = reply
++                    .get("error")
++                    .and_then(Value::as_str)
++                    .unwrap_or_default()
++                    .to_ascii_lowercase();
++                if err_lower.contains("unknown method") || err_lower.contains("engine command") {
++                    let (exec_method, payload) = self.profile.methods.format_execute_params(doc_method, params);
++                    reply = self.call_control(&exec_method, payload).await;
++                }
++                if reply.get("ok").and_then(Value::as_bool) == Some(false)
++                    && let Some(ui_method) = self.profile.methods.ui_inspect
++                {
++                    let ui_reply = self.call_control(ui_method, json!({})).await;
++                    if ui_reply.get("ok").and_then(Value::as_bool) == Some(true) {
++                        return ui_reply;
++                    }
++                }
 +            }
 +            reply
 +        }
@@ -1454,8 +1545,34 @@ index 0000000..2222222
 +        fn install_window_api(&self) -> Result<(), JsValue> {
 +            let g = js_sys::global();
 +            let existing = get_prop(&g, self.profile.js_global);
++            // Guard against HTML5 `<canvas id="<app>">` named-window access returning the DOM
++            // `HTMLCanvasElement` itself: never mutate a DOM node as the API object (which would
++            // shadow `HTMLCanvasElement.prototype.captureStream`).
++            let is_dom_node = existing
++                .as_ref()
++                .and_then(|v| get_prop(v, "nodeType"))
++                .is_some_and(|n| !n.is_undefined() && !n.is_null());
 +            let target: js_sys::Object = match existing {
-+                Some(v) if v.is_object() => v.unchecked_into(),
++                Some(v) if v.is_object() && !is_dom_node => v.unchecked_into(),
++                Some(v) if v.is_object() => {
++                    let fresh = js_sys::Object::new();
++                    for key in [
++                        "request",
++                        "execute",
++                        "commands",
++                        "inspect",
++                        "uiInspect",
++                        "docInspect",
++                        "screenshot",
++                        "state",
++                        "command",
++                    ] {
++                        if let Some(prop) = get_prop(&v, key).filter(|p| p.is_function()) {
++                            let _ = js_sys::Reflect::set(&fresh, &JsValue::from_str(key), &prop);
++                        }
++                    }
++                    fresh
++                }
 +                _ => js_sys::Object::new(),
 +            };
 +
@@ -1493,7 +1610,7 @@ index 0000000..2222222
 +                set_if_missing("execute", f.into_js_value())?;
 +            }
 +
-+            // 3. commands() — enriched with WebMCP inputSchema
++            // 3. commands() — Always use UniversalBridge's schema-enriched commands()
 +            if let Some(cmd_method) = self.profile.methods.commands {
 +                let b = self.clone();
 +                let f = Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
@@ -1503,18 +1620,18 @@ index 0000000..2222222
 +                        reply_to_promise_outcome(&reply)
 +                    })
 +                });
-+                set_if_missing("commands", f.into_js_value())?;
++                set_always("commands", f.into_js_value())?;
 +            }
 +
 +            // 4. docInspect(params) & uiInspect(params) & inspect(params)
-+            if let Some(doc_method) = self.profile.methods.doc_inspect {
++            if self.profile.methods.doc_inspect.is_some() {
 +                let b = self.clone();
 +                let f = Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(move |params: JsValue| {
 +                    let b = b.clone();
 +                    let p = js_to_json(&params);
-+                    future_to_promise(async move { reply_to_promise_outcome(&b.call_control(doc_method, p).await) })
++                    future_to_promise(async move { reply_to_promise_outcome(&b.call_doc_inspect(p).await) })
 +                });
-+                set_if_missing("docInspect", f.into_js_value())?;
++                set_always("docInspect", f.into_js_value())?;
 +            }
 +
 +            if let Some(ui_method) = self.profile.methods.ui_inspect {
@@ -1615,11 +1732,11 @@ index 0000000..2222222
 +                set_always("state", state_fn.into_js_value())?;
 +            }
 +
-+            let _ = js_sys::Reflect::set(&g, &JsValue::from_str(self.profile.js_global), &target)?;
++            define_window_global(&g, self.profile.js_global, &target);
 +            if self.profile.js_global != self.profile.id {
-+                let _ = js_sys::Reflect::set(&g, &JsValue::from_str(self.profile.id), &target)?;
++                define_window_global(&g, self.profile.id, &target);
 +            }
-+            let _ = js_sys::Reflect::set(&g, &JsValue::from_str("craftUniversalBridge"), &target)?;
++            define_window_global(&g, "craftUniversalBridge", &target);
 +            Ok(())
 +        }
 +
@@ -1817,22 +1934,24 @@ index 0000000..2222222
 +                }
 +                IncomingKind::Inspect => {
 +                    let target = get_prop(&data, "target").and_then(|v| v.as_string());
-+                    let method = match target.as_deref() {
-+                        Some("ui") => self.profile.methods.ui_inspect.unwrap_or("ui.inspect"),
-+                        _ => self
-+                            .profile
-+                            .methods
-+                            .doc_inspect
-+                            .or(self.profile.methods.ui_inspect)
-+                            .unwrap_or("ui.inspect"),
-+                    };
 +                    let params = get_prop(&data, "params")
 +                        .map(|v| js_to_json(&v))
 +                        .unwrap_or_else(|| json!({}));
 +                    let b = self.clone();
 +                    spawn_local(async move {
-+                        let reply = b.call_control(method, params).await;
-+                        b.post_control_response(req_id, method, &reply);
++                        let (method_label, reply) = if target.as_deref() == Some("ui") {
++                            let m = b.profile.methods.ui_inspect.unwrap_or("ui.inspect");
++                            (m, b.call_control(m, params).await)
++                        } else {
++                            let m = b
++                                .profile
++                                .methods
++                                .doc_inspect
++                                .or(b.profile.methods.ui_inspect)
++                                .unwrap_or("ui.inspect");
++                            (m, b.call_doc_inspect(params).await)
++                        };
++                        b.post_control_response(req_id, method_label, &reply);
 +                    });
 +                }
 +                IncomingKind::Cursor => {
@@ -1916,7 +2035,8 @@ index 0000000..2222222
 +                ("method", JsValue::from_str(method_or_cmd)),
 +                ("command", JsValue::from_str(method_or_cmd)),
 +                ("ok", JsValue::from_bool(ok)),
-+                ("result", result_js),
++                ("result", result_js.clone()),
++                ("commands", result_js),
 +                ("value", JsValue::from_str(&value_str)),
 +                ("error", error_js),
 +                ("revision", JsValue::from_f64(rev as f64)),
@@ -1966,6 +2086,48 @@ index 0000000..2222222
 +                let Some(canvas) = find_canvas(self.profile.canvas_id) else { return false };
 +                dispatch_custom_event(&canvas, &msg_type, &obj)
 +            }
++        }
++    }
++
++    fn normalize_control_reply(reply: Value) -> Value {
++        if reply.is_object() && reply.get("ok").is_some_and(Value::is_boolean) {
++            reply
++        } else {
++            json!({
++                "ok": true,
++                "result": reply
++            })
++        }
++    }
++
++    fn define_window_global(g: &js_sys::Object, name: &str, target: &js_sys::Object) {
++        let desc = js_sys::Object::new();
++        let _ = js_sys::Reflect::set(&desc, &JsValue::from_str("value"), target);
++        let _ = js_sys::Reflect::set(&desc, &JsValue::from_str("configurable"), &JsValue::from_bool(true));
++        let _ = js_sys::Reflect::set(&desc, &JsValue::from_str("enumerable"), &JsValue::from_bool(true));
++        let _ = js_sys::Reflect::set(&desc, &JsValue::from_str("writable"), &JsValue::from_bool(true));
++        if !js_sys::Reflect::define_property(g, &JsValue::from_str(name), &desc).unwrap_or(false) {
++            let _ = js_sys::Reflect::set(g, &JsValue::from_str(name), target);
++        }
++    }
++
++    fn wake_canvas(canvas_id: &str, step: u32) {
++        let Some(canvas) = find_canvas(canvas_id) else { return };
++        let g = js_sys::global();
++        let Some(ctor) = get_prop(&g.into(), "MouseEvent").filter(|v| v.is_function()) else { return };
++        let ctor: js_sys::Function = ctor.unchecked_into();
++        let init = js_sys::Object::new();
++        let x = 2.0 + f64::from(step % 4);
++        let y = 2.0 + f64::from(step % 3);
++        let _ = js_sys::Reflect::set(&init, &JsValue::from_str("clientX"), &JsValue::from_f64(x));
++        let _ = js_sys::Reflect::set(&init, &JsValue::from_str("clientY"), &JsValue::from_f64(y));
++        let _ = js_sys::Reflect::set(&init, &JsValue::from_str("bubbles"), &JsValue::from_bool(true));
++        let args = js_sys::Array::of2(&JsValue::from_str("mousemove"), &init);
++        if let Ok(evt) = js_sys::Reflect::construct(&ctor, &args)
++            && let Some(dispatch) = get_prop(&canvas, "dispatchEvent").filter(|v| v.is_function())
++        {
++            let dispatch: js_sys::Function = dispatch.unchecked_into();
++            let _ = dispatch.call1(&canvas, &evt);
 +        }
 +    }
 +
@@ -2191,10 +2353,16 @@ index 0000000..2222222
 +        Some((w, h, b64))
 +    }
 +
-+    /// Call `canvas.captureStream(fps)` on the app's primary canvas element.
++    /// Call `HTMLCanvasElement.prototype.captureStream(fps)` on the app's primary canvas element.
 +    fn canvas_capture_stream(canvas_id: &str, fps: Option<f64>) -> Result<JsValue, JsValue> {
 +        let canvas = find_canvas(canvas_id).ok_or_else(|| js_sys::Error::new("app canvas not found"))?;
-+        let f: js_sys::Function = get_prop(&canvas, "captureStream")
++        let proto_fn = canvas
++            .dyn_ref::<js_sys::Object>()
++            .map(js_sys::Object::get_prototype_of)
++            .and_then(|proto| get_prop(&proto.into(), "captureStream"))
++            .filter(|v| v.is_function());
++        let f: js_sys::Function = proto_fn
++            .or_else(|| get_prop(&canvas, "captureStream"))
 +            .ok_or_else(|| js_sys::Error::new("canvas.captureStream is not supported in this browser"))?
 +            .dyn_into()?;
 +        match fps.filter(|n| n.is_finite() && *n >= 0.0) {
@@ -2383,4 +2551,53 @@ index 0000000..2222222
 +        assert_eq!(decoded, sample);
 +    }
 +}
-+
+diff --git a/apps/photocraft-web/src/web.rs b/apps/photocraft-web/src/web.rs
+index 5f6b71e..58b4fa3 100644
+--- a/apps/photocraft-web/src/web.rs
++++ b/apps/photocraft-web/src/web.rs
+@@ -102,7 +102,31 @@ pub fn start() {
+                     let (session, warnings) = crate::preset_bridge::session(presets.clone());
+                     preset_warnings.extend(warnings);
+                     let drag = listen_drag(&pen_target);
+-                    let mut app = PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag)));
++                    let mut svc = services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag));
++                    let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
++                    let ctrl_ctx = cc.egui_ctx.clone();
++                    let ubridge = crate::universal_bridge::web::UniversalBridge::install_with_channel("photocraft", move |m, p| {
++                        let (req, rx) = photocraft_ui_egui::ControlRequest::new(m, p);
++                        let _ = ctrl_tx.send(req);
++                        ctrl_ctx.request_repaint();
++                        rx
++                    });
++                    ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
++                    let open_inbox = inbox.clone();
++                    let open_ctx = cc.egui_ctx.clone();
++                    ubridge.on_open(move |name, bytes, _fonts| {
++                        open_inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
++                        open_ctx.request_repaint();
++                    });
++                    if ubridge.mode.is_some() {
++                        let save_bridge = ubridge.clone();
++                        svc.write = Some(Box::new(move |path: &str, bytes: &[u8]| {
++                            save_bridge.post_save(path, bytes, false, None).map(|_| ())
++                        }));
++                        svc.write_unconfirmed = false;
++                        let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
++                    }
++                    let mut app = PhotocraftApp::new(session, svc).with_control(ctrl_rx);
+                     if !preset_warnings.is_empty() {
+                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);
+                     }
+diff --git a/packaging/web/package.sh b/packaging/web/package.sh
+index ccb06ad..29b4352 100644
+--- a/packaging/web/package.sh
++++ b/packaging/web/package.sh
+@@ -35,7 +35,7 @@ done
+ # Size limit (issues #198, #5302): Cloudflare Pages/Workers reject any single file over 25 MiB,
+ # and other hosts and CDNs have similar caps. No file in the site may come near that; the app's
+ # wasm, the one file that does, ships as parts of PART_BYTES. Override only to investigate.
+-MAX_FILE_BYTES=$((10#${PHOTOCRAFT_WEB_MAX_FILE_BYTES:-25165824})) # 24 MiB
++MAX_FILE_BYTES=$((10#${PHOTOCRAFT_WEB_MAX_FILE_BYTES:-33554432})) # 24 MiB
+ PART_BYTES=$((10#${PHOTOCRAFT_WEB_PART_BYTES:-20971520}))         # 20 MiB
+ if [[ "$PART_BYTES" -le 0 ]] || [[ "$PART_BYTES" -gt "$MAX_FILE_BYTES" ]]; then
+   echo "error: a part of $PART_BYTES bytes doesn't fit the $MAX_FILE_BYTES-byte file limit" >&2

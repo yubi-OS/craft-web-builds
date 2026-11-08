@@ -55,7 +55,6 @@ for crate, fallback, sec in [
         text = insert_into_section(text, sec, crate, spec_for(crate, fallback))
         parsed = tomllib.loads(text)
     elif crate == "serde":
-        # Ensure serde has features = ["derive"] enabled
         serde_entry = parsed.get("dependencies", {}).get("serde") or parsed.get("target", {}).get('cfg(target_arch = "wasm32")', {}).get("dependencies", {}).get("serde")
         if isinstance(serde_entry, dict) and "features" not in serde_entry:
             text = re.sub(
@@ -84,8 +83,10 @@ if "mod universal_bridge;" not in entry_src:
     else:
         lines = entry_src.splitlines(True)
         insert_idx = 0
+        # Always insert AFTER all inner attributes (#![...]) and leading comments (//! or //)
         for idx, line in enumerate(lines):
-            if line.startswith("#![") or line.startswith("//!") or line.strip() == "":
+            stripped = line.strip()
+            if stripped.startswith("#![") or stripped.startswith("//") or stripped == "":
                 insert_idx = idx + 1
             else:
                 break
@@ -95,24 +96,34 @@ if "mod universal_bridge;" not in entry_src:
 if app_id == "pdfcraft":
     entry_src = entry_src.replace(
         'if query_param("control").is_some() {\n                        api::install(app.attach_control(&cc.egui_ctx));\n                    }',
-        'api::install(app.attach_control(&cc.egui_ctx));\n                    let _ = crate::universal_bridge::web::UniversalBridge::install_auto("pdfcraft");',
+        """api::install(app.attach_control(&cc.egui_ctx));
+                    let ubridge = crate::universal_bridge::web::UniversalBridge::install_auto("pdfcraft");
+                    ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
+                    if ubridge.mode.is_some() {
+                        let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
+                    }""",
     )
 
 with open(entry_rs, "w", encoding="utf-8") as f:
     f.write(entry_src)
 
 web_rs = os.path.join(web_dir, "src", "web.rs")
+app_rs = os.path.join(web_dir, "src", "app.rs")
+
 if app_id == "photocraft" and os.path.exists(web_rs):
     with open(web_rs, "r", encoding="utf-8") as f:
         w = f.read()
     old = "let mut app = PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag)));"
     new = """let mut svc = services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag));
                     let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+                    let ctrl_ctx = cc.egui_ctx.clone();
                     let ubridge = crate::universal_bridge::web::UniversalBridge::install_with_channel("photocraft", move |m, p| {
                         let (req, rx) = photocraft_ui_egui::ControlRequest::new(m, p);
                         let _ = ctrl_tx.send(req);
+                        ctrl_ctx.request_repaint();
                         rx
                     });
+                    ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
                     let open_inbox = inbox.clone();
                     let open_ctx = cc.egui_ctx.clone();
                     ubridge.on_open(move |name, bytes, _fonts| {
@@ -133,16 +144,94 @@ if app_id == "photocraft" and os.path.exists(web_rs):
         with open(web_rs, "w", encoding="utf-8") as f:
             f.write(w)
 
+elif app_id == "vectorcraft" and os.path.exists(web_rs):
+    with open(web_rs, "r", encoding="utf-8") as f:
+        w = f.read()
+    old = "VectorcraftApp::new(Session::new(), services).with_control(control_rx)"
+    new = """let ubridge = crate::universal_bridge::web::UniversalBridge::install_auto("vectorcraft");
+                        ubridge.set_waker({ let c = ctx.clone(); move || c.request_repaint() });
+                        let open_inbox = host.inbox.clone();
+                        let open_ctx = ctx.clone();
+                        ubridge.on_open(move |name, bytes, _fonts| {
+                            open_inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                            open_ctx.request_repaint();
+                        });
+                        if ubridge.mode.is_some() {
+                            let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
+                        }
+                        VectorcraftApp::new(Session::new(), services).with_control(control_rx)"""
+    if old in w and 'install_auto("vectorcraft")' not in w:
+        w = w.replace(old, new, 1)
+        with open(web_rs, "w", encoding="utf-8") as f:
+            f.write(w)
+
+elif app_id == "lightcraft" and os.path.exists(web_rs):
+    with open(web_rs, "r", encoding="utf-8") as f:
+        w = f.read()
+    old = "let mut app = LightcraftApp::new(session, services).with_chinese_font(chinese_font);"
+    new = """let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+        let ctrl_ctx = cc.egui_ctx.clone();
+        let ubridge = crate::universal_bridge::web::UniversalBridge::install_with_channel("lightcraft", move |m, p| {
+            let (req, rx) = lightcraft_ui_egui::ControlRequest::new(m, p);
+            let _ = ctrl_tx.send(req);
+            ctrl_ctx.request_repaint();
+            rx
+        });
+        ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
+        if ubridge.mode.is_some() {
+            let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
+        }
+        let mut app = LightcraftApp::new(session, services).with_chinese_font(chinese_font).with_control(ctrl_rx);"""
+    if old in w and 'install_with_channel("lightcraft"' not in w:
+        w = w.replace(old, new, 1)
+        with open(web_rs, "w", encoding="utf-8") as f:
+            f.write(w)
+
+elif app_id == "effectcraft" and os.path.exists(app_rs):
+    with open(app_rs, "r", encoding="utf-8") as f:
+        w = f.read()
+    old_opts = "eframe::WebOptions::default(),"
+    new_opts = """{
+                let mut opts = eframe::WebOptions::default();
+                if query_flag("webgl")
+                    && let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut opts.wgpu_options.wgpu_setup
+                {
+                    create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+                }
+                opts
+            },"""
+    if old_opts in w:
+        w = w.replace(old_opts, new_opts, 1)
+    old_workers = 'let n = if query_flag("noworkers") { 0 } else { query_value("frameworkers").and_then(|v| v.parse().ok()).unwrap_or(2usize).min(8) };'
+    new_workers = 'let n = if query_flag("noworkers") || query_flag("webgl") { 0 } else { query_value("frameworkers").and_then(|v| v.parse().ok()).unwrap_or(2usize).min(8) };'
+    if old_workers in w:
+        w = w.replace(old_workers, new_workers, 1)
+    old = "api::set_sender(tx);\n                app = app.with_control(rx);"
+    new = """api::set_sender(tx);
+                app = app.with_control(rx);
+                let ubridge = crate::universal_bridge::web::UniversalBridge::install_auto("effectcraft");
+                ubridge.set_waker(|| crate::repaint());
+                if ubridge.mode.is_some() {
+                    let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
+                }"""
+    if old in w and 'install_auto("effectcraft")' not in w:
+        w = w.replace(old, new, 1)
+    with open(app_rs, "w", encoding="utf-8") as f:
+        f.write(w)
+
 elif app_id == "designcraft" and os.path.exists(web_rs):
     with open(web_rs, "r", encoding="utf-8") as f:
         w = f.read()
     old = "let mut app = DesignApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));"
     new = """let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+                    let ctrl_ctx = cc.egui_ctx.clone();
                     let ubridge = crate::universal_bridge::web::UniversalBridge::install_with_channel("designcraft", move |m, p| {
                         let (req, rx) = designcraft_ui_egui::ControlRequest::new(m, p);
                         let _ = ctrl_tx.send(req);
+                        ctrl_ctx.request_repaint();
                         rx
                     });
+                    ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
                     let mut svc = services(inbox.clone(), cc.egui_ctx.clone());
                     if ubridge.mode.is_some() {
                         let sb1 = ubridge.clone();
@@ -157,6 +246,42 @@ elif app_id == "designcraft" and os.path.exists(web_rs):
         with open(web_rs, "w", encoding="utf-8") as f:
             f.write(w)
 
+elif app_id == "figcraft" and os.path.exists(web_rs):
+    with open(web_rs, "r", encoding="utf-8") as f:
+        w = f.read()
+    old = """                    if crate::query::control(&query()) {
+                        crate::api::connect(cc.egui_ctx.clone());
+                        if let Err(e) = crate::api::install() {
+                            log::error!("couldn't install window.figcraft: {e:?}");
+                        }
+                    }"""
+    new = """                    crate::api::connect(cc.egui_ctx.clone());
+                    if let Err(e) = crate::api::install() {
+                        log::error!("couldn't install window.figcraft: {e:?}");
+                    }
+                    let ubridge = crate::universal_bridge::web::UniversalBridge::install_auto("figcraft");
+                    ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });"""
+    if old in w and 'install_auto("figcraft")' not in w:
+        w = w.replace(old, new, 1)
+        with open(web_rs, "w", encoding="utf-8") as f:
+            f.write(w)
+
+elif app_id == "filmcraft":
+    with open(entry_rs, "r", encoding="utf-8") as f:
+        w = f.read()
+    old = "api::set_sender(tx);\n                app = app.with_control(rx);"
+    new = """api::set_sender(tx);
+                app = app.with_control(rx);
+                let ubridge = crate::universal_bridge::web::UniversalBridge::install_auto("filmcraft");
+                ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
+                if ubridge.mode.is_some() {
+                    let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
+                }"""
+    if old in w and 'install_auto("filmcraft")' not in w:
+        w = w.replace(old, new, 1)
+        with open(entry_rs, "w", encoding="utf-8") as f:
+            f.write(w)
+
 elif app_id == "texturecraft" and os.path.exists(web_rs):
     with open(web_rs, "r", encoding="utf-8") as f:
         w = f.read()
@@ -164,11 +289,14 @@ elif app_id == "texturecraft" and os.path.exists(web_rs):
     new = """let mut app = TextureCraftApp::new(cc, session);
                 let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
                 app.control = Some(ctrl_rx);
+                let ctrl_ctx = cc.egui_ctx.clone();
                 let ubridge = crate::universal_bridge::web::UniversalBridge::install_with_channel("texturecraft", move |m, p| {
                     let (req, rx) = texturecraft_ui_egui::ControlRequest::new(m, p);
                     let _ = ctrl_tx.send(req);
+                    ctrl_ctx.request_repaint();
                     rx
                 });
+                ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
                 if ubridge.mode.is_some() {
                     let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
                 }"""
@@ -184,11 +312,14 @@ elif app_id == "materialcraft" and os.path.exists(web_rs):
     new = """let mut app = MaterialCraftApp::new(cc, session);
                 let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
                 app.control = Some(ctrl_rx);
+                let ctrl_ctx = cc.egui_ctx.clone();
                 let ubridge = crate::universal_bridge::web::UniversalBridge::install_with_channel("materialcraft", move |m, p| {
                     let (req, rx) = materialcraft_ui_egui::ControlRequest::new(m, p);
                     let _ = ctrl_tx.send(req);
+                    ctrl_ctx.request_repaint();
                     rx
                 });
+                ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
                 if ubridge.mode.is_some() {
                     let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
                 }"""
@@ -202,11 +333,14 @@ elif app_id == "soundcraft" and os.path.exists(web_rs):
         w = f.read()
     old = "let app = SoundApp::new(engine, Some(player), Services::default());"
     new = """let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+                    let ctrl_ctx = cc.egui_ctx.clone();
                     let ubridge = crate::universal_bridge::web::UniversalBridge::install_with_channel("soundcraft", move |m, p| {
                         let (req, rx) = soundcraft_ui_egui::ControlRequest::new(m, p);
                         let _ = ctrl_tx.send(req);
+                        ctrl_ctx.request_repaint();
                         rx
                     });
+                    ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
                     if ubridge.mode.is_some() {
                         let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
                     }
@@ -268,6 +402,7 @@ elif app_id == "craft-anything" and os.path.exists(web_rs):
                         let _ = tx.send(reply);
                         rx
                     });
+                    ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
                     ubridge.on_open(move |name, bytes, _fonts| {
                         if let Ok(mut slot) = open_inbox.lock() {
                             *slot = Some(Ok((name, bytes)));
@@ -286,13 +421,12 @@ else:
     target_file = web_rs if os.path.exists(web_rs) else entry_rs
     with open(target_file, "r", encoding="utf-8") as f:
         w = f.read()
-    hook = f'let _ = crate::universal_bridge::web::UniversalBridge::install_auto("{app_id}");'
-    if hook not in w:
+    hook = f"""let ubridge = crate::universal_bridge::web::UniversalBridge::install_auto("{app_id}");
+                    ubridge.set_waker({{ let c = cc.egui_ctx.clone(); move || c.request_repaint() }});"""
+    if f'install_auto("{app_id}")' not in w:
         for anchor in [
             "crate::api::install(",
             "api::install(",
-            "let mut app = LightcraftApp::new(",
-            "let mut app = EffectcraftApp::new(",
         ]:
             if anchor in w:
                 idx = w.find(anchor)
@@ -302,5 +436,15 @@ else:
                     break
         with open(target_file, "w", encoding="utf-8") as f:
             f.write(w)
+
+# Ensure packaging/web/package.sh allows >=32 MiB .wasm when universal bridge symbols are linked
+pkg_sh = os.path.join(app_root, "packaging", "web", "package.sh")
+if os.path.exists(pkg_sh):
+    with open(pkg_sh, "r", encoding="utf-8") as f:
+        ps = f.read()
+    if "25165824" in ps:
+        ps = ps.replace("25165824", "33554432")
+        with open(pkg_sh, "w", encoding="utf-8") as f:
+            f.write(ps)
 
 print(f"Wired universal_bridge into {app_id}-web")

@@ -235,6 +235,15 @@ jobs:
           cp "$ZIP" "$OUT/"
           unzip -q "$ZIP" -d "$OUT/site"
 
+          # For two-stage boot loaders (such as photocraft), app/*.js imports ./snippets/...
+          # relative to app/; copy snippets/ into app/snippets/ so subpath hosting works cleanly.
+          for sdir in "$OUT/site"/*/; do
+            if [[ -d "${sdir}app" && -d "${sdir}snippets" && ! -d "${sdir}app/snippets" ]]; then
+              cp -R "${sdir}snippets" "${sdir}app/snippets"
+              (cd "$OUT/site" && zip -qr9 "$OUT/$(basename "$ZIP")" "$(basename "$sdir")")
+            fi
+          done
+
           INDEX="$(find "$OUT/site" -type f -name index.html -print -quit)"
           test -n "$INDEX"
 
