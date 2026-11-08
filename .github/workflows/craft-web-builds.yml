@@ -75,13 +75,16 @@ jobs:
           chmod 0755 "$STAGE/bin/wasm-bindgen" "$STAGE/trunk-cache/wasm-bindgen-0.2.129/wasm-bindgen"
 
           # 3. Stage wasm-opt version_123 (try release tarball; fall back to system binaryen package)
+          mkdir -p "$STAGE/lib" "$STAGE/trunk-cache/wasm-opt-version_123/lib"
           if curl --proto '=https' -fsSL --retry 6 --retry-all-errors --retry-delay 2 \
             "https://github.com/WebAssembly/binaryen/releases/download/version_123/binaryen-version_123-x86_64-linux.tar.gz" \
             -o "$RUNNER_TEMP/binaryen.tar.gz"; then
             tar -xzf "$RUNNER_TEMP/binaryen.tar.gz" --strip-components=1 -C "$STAGE/trunk-cache/wasm-opt-version_123"
+            cp -a "$STAGE/trunk-cache/wasm-opt-version_123/lib/"* "$STAGE/lib/" 2>/dev/null || true
           else
             sudo apt-get update && sudo apt-get install -y --no-install-recommends binaryen
             cp /usr/bin/wasm-opt "$STAGE/trunk-cache/wasm-opt-version_123/bin/wasm-opt"
+            find /usr/lib -name "libbinaryen.so*" -exec cp -a {} "$STAGE/lib/" \; -exec cp -a {} "$STAGE/trunk-cache/wasm-opt-version_123/lib/" \;
           fi
           cp "$STAGE/trunk-cache/wasm-opt-version_123/bin/wasm-opt" "$STAGE/bin/wasm-opt"
           chmod 0755 "$STAGE/bin/wasm-opt" "$STAGE/trunk-cache/wasm-opt-version_123/bin/wasm-opt"
@@ -195,6 +198,10 @@ jobs:
           set -euo pipefail
           STAGE="$RUNNER_TEMP/wasm-build-tools"
           chmod 0755 "$STAGE/bin/"*
+          if [[ -d "$STAGE/lib" ]] && compgen -G "$STAGE/lib/*" > /dev/null; then
+            sudo cp -a "$STAGE/lib/"* /usr/local/lib/
+            sudo ldconfig
+          fi
           sudo install -m 0755 "$STAGE/bin/trunk" /usr/local/bin/trunk
           sudo install -m 0755 "$STAGE/bin/wasm-bindgen" /usr/local/bin/wasm-bindgen
           sudo install -m 0755 "$STAGE/bin/wasm-opt" /usr/local/bin/wasm-opt
