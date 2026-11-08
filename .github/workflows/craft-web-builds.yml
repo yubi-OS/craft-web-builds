@@ -326,6 +326,7 @@ jobs:
       - name: Create manifest
         run: |
           set -euo pipefail
+          rm -rf dist/all/site
           jq -s 'sort_by(.app)' dist/all/*.json > dist/all/manifest.json
           ls -lh dist/all/
 
@@ -370,6 +371,7 @@ jobs:
           fi
 
           gh api "/repos/${REPO}/actions/artifacts/${ART_ID}/zip" > "$RUNNER_TEMP/$COMBINED_ZIP"
+          zip -qd "$RUNNER_TEMP/$COMBINED_ZIP" "site/*" || true
           ls -lh "$RUNNER_TEMP/$COMBINED_ZIP"
 
           REL_ID="$(gh api "/repos/${REPO}/releases" --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\") | .id" | head -n 1)"
