@@ -228,4 +228,5 @@ jobs:
           retention-days: 14
 
       - name: Report artifact
-        run: echo "Suite artifact ID: ${{ steps.upload.outputs.artifact-id }}" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "Suite artifact ID: ${{ steps.upload.outputs.artifact-id }}" >> "$GITHUB_STEP_SUMMARY"
