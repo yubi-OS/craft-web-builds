@@ -202,12 +202,29 @@ const server = http.createServer((req, res) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 
-const browser = await puppeteer.launch({
+// Chrome cold-start on a loaded CI runner (right after a multi-minute wasm build) can exceed
+// puppeteer's 30s default launch timeout; give it 120s and retry the launch a few times.
+async function launchBrowser(attempts = 3) {
+  for (let i = 1; ; i++) {
+    try {
+      return await puppeteer.launch(LAUNCH_OPTS);
+    } catch (e) {
+      console.error(`[launch] attempt ${i}/${attempts} failed: ${e && e.message}`);
+      if (i >= attempts) throw e;
+      await new Promise((r) => setTimeout(r, 5000 * i));
+    }
+  }
+}
+
+const LAUNCH_OPTS = {
   executablePath: CHROME_PATH,
   headless: true,
+  timeout: 120000,
+  protocolTimeout: 300000,
   args: [
     '--no-sandbox',
     '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
     '--use-gl=angle',
     '--use-angle=swiftshader',
     '--enable-unsafe-swiftshader',
@@ -215,7 +232,8 @@ const browser = await puppeteer.launch({
     '--ignore-gpu-blocklist',
     '--window-size=1024,720',
   ],
-});
+};
+const browser = await launchBrowser();
 
 const existing = fs.existsSync(OUT_PATH) ? JSON.parse(fs.readFileSync(OUT_PATH, 'utf-8')) : {};
 

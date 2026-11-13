@@ -150,7 +150,7 @@ elif app_id == "vectorcraft" and os.path.exists(web_rs):
     old = "VectorcraftApp::new(Session::new(), services).with_control(control_rx)"
     new = """let ubridge = crate::universal_bridge::web::UniversalBridge::install_auto("vectorcraft");
                         ubridge.set_waker({ let c = ctx.clone(); move || c.request_repaint() });
-                        let open_inbox = host.inbox.clone();
+                        let open_inbox = __VC_OPEN_INBOX__;
                         let open_ctx = ctx.clone();
                         ubridge.on_open(move |name, bytes, _fonts| {
                             open_inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
@@ -160,6 +160,9 @@ elif app_id == "vectorcraft" and os.path.exists(web_rs):
                             let _ = ubridge.post_ready(env!("CARGO_PKG_VERSION"), None);
                         }
                         VectorcraftApp::new(Session::new(), services).with_control(control_rx)"""
+    # Upstream storytold/vectorcraft (>= 4306a1d) split `Host::inbox` into `OpenInboxes { dropped, picked, page }`;
+    # bridge `open` requests are page-script opens, so route them to `inbox.page` (the `window.vectorcraft.openFile` inbox).
+    new = new.replace("__VC_OPEN_INBOX__", "host.inbox.page.clone()" if "struct OpenInboxes" in w else "host.inbox.clone()")
     if old in w and 'install_auto("vectorcraft")' not in w:
         w = w.replace(old, new, 1)
         with open(web_rs, "w", encoding="utf-8") as f:
