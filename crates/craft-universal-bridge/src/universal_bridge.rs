@@ -79,6 +79,12 @@ pub const CAPABILITIES: &[&str] = &[
     "fonts",
     "lang",
     "handoff",
+    "import",
+    "importFile",
+    "openFile",
+    "loadHold",
+    "readyNotify",
+    "pointerClick",
 ];
 
 /// The control-channel method names backing each unified function for an app.
@@ -779,6 +785,8 @@ pub enum IncomingKind {
     Hello,
     /// `<app>:open` or `open` → open a document (and optional font files).
     Open,
+    /// `<app>:import`, `import`, `importFile`, `insert`, or `place` → redirect file/asset import into the app.
+    Import,
     /// `<app>:save` or `save` → trigger Save / Export and return bytes to the host.
     Save,
     /// `<app>:saved`, `saved`, or `saveAck` → confirm persistence of `revision` / `id`.
@@ -824,8 +832,9 @@ impl IncomingKind {
         };
 
         match raw_kind {
-            "host" | "hello" | "ping" => Some(Self::Hello),
+            "host" | "hello" | "ping" | "ready-request" | "readyRequest" | "status" => Some(Self::Hello),
             "open" => Some(Self::Open),
+            "import" | "importFile" | "import-file" | "insert" | "place" | "load" | "loadFile" | "load-file" | "openFile" | "open-file" => Some(Self::Import),
             "save" => Some(Self::Save),
             "saved" | "saveAck" | "save-ack" => Some(Self::Saved),
             "picked" => Some(Self::Picked),
@@ -849,7 +858,9 @@ impl IncomingKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutgoingKind {
     Ready,
+    Loading,
     Opened,
+    Imported,
     OpenFailed,
     Save,
     SaveResult,
@@ -868,7 +879,9 @@ impl OutgoingKind {
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Ready => "ready",
+            Self::Loading => "loading",
             Self::Opened => "opened",
+            Self::Imported => "imported",
             Self::OpenFailed => "open-failed",
             Self::Save => "save",
             Self::SaveResult => "saveResult",
@@ -887,6 +900,179 @@ impl OutgoingKind {
     pub fn message_type(self, app: &str) -> String {
         format!("{app}:{}", self.kind())
     }
+}
+
+/// Infer a standard MIME type from a file name extension.
+pub fn infer_mime_from_name(name: &str) -> &'static str {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" | "vcraft" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "json" | "excalidraw" => "application/json",
+        "txt" | "md" | "markdown" => "text/plain",
+        "html" | "htm" => "text/html",
+        "xlsx" | "xls" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "docx" | "doc" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" | "ppt" | "deckcraft" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "dxf" | "dwg" => "image/vnd.dxf",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse CSV, TSV, or pipe-table text into a 2D array of cell strings for spreadsheet/table import.
+pub fn parse_tabular_text_rows(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('|') && line.ends_with('|') {
+            let inner = &line[1..line.len().saturating_sub(1)];
+            if inner.chars().all(|c| matches!(c, '-' | ':' | '|' | ' ')) {
+                continue;
+            }
+            let cells: Vec<String> = inner.split('|').map(|s| s.trim().to_string()).collect();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        } else if line.contains('\t') {
+            rows.push(line.split('\t').map(|s| s.trim().to_string()).collect());
+        } else if line.contains(',') {
+            rows.push(
+                line.split(',')
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .collect(),
+            );
+        } else {
+            rows.push(vec![line.to_string()]);
+        }
+    }
+    rows
+}
+
+/// Resolve a coordinate pair `(x, y)` (either normalized `[0.0..=1.0]` or logical CSS pixels)
+/// against a canvas bounding rect `(rect_left, rect_top, rect_w, rect_h)`.
+/// Returns `(norm_x, norm_y, css_x, css_y, client_x, client_y)`.
+pub fn resolve_canvas_point(
+    x: f64,
+    y: f64,
+    normalized_hint: Option<bool>,
+    rect_left: f64,
+    rect_top: f64,
+    rect_w: f64,
+    rect_h: f64,
+) -> (f64, f64, f64, f64, f64, f64) {
+    let w = if rect_w.is_finite() && rect_w > 1.0 { rect_w } else { 1024.0 };
+    let h = if rect_h.is_finite() && rect_h > 1.0 { rect_h } else { 720.0 };
+    let left = if rect_left.is_finite() { rect_left } else { 0.0 };
+    let top = if rect_top.is_finite() { rect_top } else { 0.0 };
+    let is_norm = match normalized_hint {
+        Some(b) => b,
+        None => (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) && (x != 0.0 || y != 0.0),
+    };
+    let (norm_x, norm_y, css_x, css_y) = if is_norm {
+        let nx = x.clamp(0.0, 1.0);
+        let ny = y.clamp(0.0, 1.0);
+        (nx, ny, (nx * w).round(), (ny * h).round())
+    } else {
+        let cx = x.clamp(0.0, w);
+        let cy = y.clamp(0.0, h);
+        ((cx / w).clamp(0.0, 1.0), (cy / h).clamp(0.0, 1.0), cx.round(), cy.round())
+    };
+    (norm_x, norm_y, css_x, css_y, (left + css_x).round(), (top + css_y).round())
+}
+
+/// Scale a pointer payload `{ x, y, normalized, space, events }` to canvas logical points
+/// and build the ordered list of DOM pointer events `(kind, client_x, client_y, button)` to dispatch.
+pub fn scale_pointer_payload_for_canvas(
+    payload: &Value,
+    rect_left: f64,
+    rect_top: f64,
+    rect_w: f64,
+    rect_h: f64,
+) -> (Value, Vec<(String, f64, f64, i16)>) {
+    let mut out = payload.clone();
+    let norm_hint = payload
+        .get("normalized")
+        .and_then(Value::as_bool)
+        .or_else(|| (payload.get("space").and_then(Value::as_str) == Some("normalized")).then_some(true));
+    let top_x = payload.get("x").and_then(Value::as_f64).unwrap_or(0.5);
+    let top_y = payload.get("y").and_then(Value::as_f64).unwrap_or(0.5);
+    let top_btn = payload.get("button").and_then(Value::as_i64).unwrap_or(0) as i16;
+    let (nx, ny, cx, cy, client_x, client_y) =
+        resolve_canvas_point(top_x, top_y, norm_hint, rect_left, rect_top, rect_w, rect_h);
+
+    let mut dom_events: Vec<(String, f64, f64, i16)> = Vec::new();
+
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("x".to_string(), json!(cx));
+        obj.insert("y".to_string(), json!(cy));
+        obj.insert("normX".to_string(), json!(nx));
+        obj.insert("normY".to_string(), json!(ny));
+        obj.insert("clientX".to_string(), json!(client_x));
+        obj.insert("clientY".to_string(), json!(client_y));
+        obj.insert("normalized".to_string(), json!(false));
+
+        if let Some(ev_arr) = obj.get_mut("events").and_then(Value::as_array_mut) {
+            for ev in ev_arr.iter_mut() {
+                if let Some(ev_obj) = ev.as_object_mut() {
+                    let ex = ev_obj.get("x").and_then(Value::as_f64).unwrap_or(top_x);
+                    let ey = ev_obj.get("y").and_then(Value::as_f64).unwrap_or(top_y);
+                    let e_norm = ev_obj.get("normalized").and_then(Value::as_bool).or(norm_hint);
+                    let btn = ev_obj.get("button").and_then(Value::as_i64).unwrap_or(i64::from(top_btn)) as i16;
+                    let (enx, eny, ecx, ecy, eclx, ecly) =
+                        resolve_canvas_point(ex, ey, e_norm, rect_left, rect_top, rect_w, rect_h);
+                    ev_obj.insert("x".to_string(), json!(ecx));
+                    ev_obj.insert("y".to_string(), json!(ecy));
+                    ev_obj.insert("normX".to_string(), json!(enx));
+                    ev_obj.insert("normY".to_string(), json!(eny));
+                    ev_obj.insert("clientX".to_string(), json!(eclx));
+                    ev_obj.insert("clientY".to_string(), json!(ecly));
+                    let kind = ev_obj
+                        .get("type")
+                        .or_else(|| ev_obj.get("kind"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("move")
+                        .to_ascii_lowercase();
+                    dom_events.push((kind, eclx, ecly, btn));
+                }
+            }
+        }
+    }
+
+    if dom_events.is_empty() {
+        dom_events.push(("move".to_string(), client_x, client_y, top_btn));
+        if payload.get("click").and_then(Value::as_bool) != Some(false) {
+            dom_events.push(("down".to_string(), client_x, client_y, top_btn));
+            dom_events.push(("up".to_string(), client_x, client_y, top_btn));
+            dom_events.push(("click".to_string(), client_x, client_y, top_btn));
+        }
+    } else if dom_events.iter().any(|(k, _, _, _)| k == "up")
+        && !dom_events.iter().any(|(k, _, _, _)| k == "click")
+    {
+        if let Some((_, last_x, last_y, last_btn)) = dom_events.last().cloned() {
+            dom_events.push(("click".to_string(), last_x, last_y, last_btn));
+        }
+    }
+
+    (out, dom_events)
 }
 
 /// Clamp an autosave interval in milliseconds to `[MIN_AUTOSAVE_MS, MAX_AUTOSAVE_MS]`;
@@ -1177,6 +1363,9 @@ pub mod web {
         pub waker: Rc<RefCell<Option<Box<dyn Fn()>>>>,
         in_flight: Rc<Cell<usize>>,
         last_dirty_reported: Rc<Cell<Option<bool>>>,
+        pub app_ready: Rc<Cell<bool>>,
+        pub ready_version: Rc<RefCell<String>>,
+        pub held_queue: Rc<RefCell<Vec<(IncomingKind, JsValue)>>>,
     }
 
     impl UniversalBridge {
@@ -1279,6 +1468,7 @@ pub mod web {
             };
 
             let require_ack = matches!(mode, Some(HostMode::Embed)) || query_has(&query, "saveAck");
+            install_dom_hooks(profile.id, profile.canvas_id);
             let bridge = Self {
                 profile,
                 mode,
@@ -1292,10 +1482,14 @@ pub mod web {
                 waker: Rc::default(),
                 in_flight: Rc::new(Cell::new(0)),
                 last_dirty_reported: Rc::new(Cell::new(None)),
+                app_ready: Rc::new(Cell::new(false)),
+                ready_version: Rc::new(RefCell::new(env!("CARGO_PKG_VERSION").to_string())),
+                held_queue: Rc::new(RefCell::new(Vec::new())),
             };
 
             let _ = bridge.install_window_api();
             bridge.install_host_listener();
+            bridge.start_readiness_gate();
             bridge
         }
 
@@ -1315,13 +1509,38 @@ pub mod web {
             *self.save_trigger_cb.borrow_mut() = Some(Box::new(f));
         }
 
-        /// Notify the host frame that the app is ready and listening.
+        /// Notify the host frame that the app is ready and listening (or store version until canvas readiness completes).
         pub fn post_ready(&self, app_version: &str, build_sha: Option<&str>) -> bool {
+            *self.ready_version.borrow_mut() = app_version.to_string();
+            if self.app_ready.get() || is_canvas_and_dom_ready(self.profile.id, self.profile.canvas_id) {
+                self.app_ready.set(true);
+                set_window_bridge_ready_flag(true);
+                let ok = self.emit_ready_now(app_version, build_sha);
+                self.flush_held_queue();
+                ok
+            } else {
+                let held_len = self.held_queue.borrow().len() as f64;
+                self.post_to_host(
+                    OutgoingKind::Loading,
+                    &[
+                        ("ready", JsValue::from_bool(false)),
+                        ("status", JsValue::from_str("loading")),
+                        ("heldCount", JsValue::from_f64(held_len)),
+                    ],
+                    None,
+                )
+            }
+        }
+
+        fn emit_ready_now(&self, app_version: &str, build_sha: Option<&str>) -> bool {
             let caps: js_sys::Array = CAPABILITIES.iter().map(|c| JsValue::from_str(c)).collect();
             let rev_val = build_sha.map_or(JsValue::NULL, JsValue::from_str);
+            let (_, _, rect_w, rect_h) = canvas_bounding_rect(self.profile.canvas_id);
+            let held_flushed = self.held_queue.borrow().len() as f64;
             self.post_to_host(
                 OutgoingKind::Ready,
                 &[
+                    ("ready", JsValue::from_bool(true)),
                     ("version", PROTOCOL_VERSION.into()),
                     ("bridgeVersion", BRIDGE_ID.into()),
                     ("app", self.profile.id.into()),
@@ -1329,10 +1548,166 @@ pub mod web {
                     ("formatExtension", self.profile.native_ext.into()),
                     ("rev", rev_val),
                     ("file", false.into()),
+                    ("canvasWidth", JsValue::from_f64(rect_w)),
+                    ("canvasHeight", JsValue::from_f64(rect_h)),
+                    ("flushedCount", JsValue::from_f64(held_flushed)),
                     ("capabilities", caps.into()),
                 ],
                 None,
             )
+        }
+
+        fn start_readiness_gate(&self) {
+            let b = self.clone();
+            spawn_local(async move {
+                let mut elapsed = 0.0;
+                while elapsed < 25_000.0 {
+                    if is_canvas_and_dom_ready(b.profile.id, b.profile.canvas_id) {
+                        break;
+                    }
+                    if let Some(w) = b.waker.borrow().as_ref() {
+                        w();
+                    }
+                    wake_canvas(b.profile.canvas_id, (elapsed as u32) / 40);
+                    sleep_ms(40.0).await;
+                    elapsed += 40.0;
+                }
+                // Give eframe 2 repaint frames after canvas mount so its control loop is actively draining
+                for step in 0..2u32 {
+                    if let Some(w) = b.waker.borrow().as_ref() {
+                        w();
+                    }
+                    wake_canvas(b.profile.canvas_id, step);
+                    sleep_ms(24.0).await;
+                }
+                if !b.app_ready.get() {
+                    b.app_ready.set(true);
+                    set_window_bridge_ready_flag(true);
+                    let ver = b.ready_version.borrow().clone();
+                    let _ = b.emit_ready_now(&ver, None);
+                }
+                b.flush_held_queue();
+            });
+        }
+
+        fn flush_held_queue(&self) {
+            // Also drain any pre-boot messages captured in window.__craftPreBootQueue before WASM initialized
+            let preboot = drain_window_preboot_queue(self.profile.id);
+            let mut items: Vec<(IncomingKind, JsValue)> = Vec::new();
+            for (k, d) in preboot {
+                items.push((k, d));
+            }
+            {
+                let mut q = self.held_queue.borrow_mut();
+                items.append(&mut *q);
+            }
+            if items.is_empty() {
+                return;
+            }
+            let b = self.clone();
+            spawn_local(async move {
+                for (kind, data) in items {
+                    b.dispatch_ready_incoming(kind, data);
+                    sleep_ms(20.0).await;
+                }
+            });
+        }
+
+        pub async fn import_or_open_payload(&self, data: &JsValue, is_import: bool) -> Value {
+            let raw_name = get_prop(data, "name")
+                .or_else(|| get_prop(data, "fileName"))
+                .or_else(|| get_prop(data, "filename"))
+                .and_then(|v| v.as_string());
+            let name = sanitize_file_name(raw_name.as_deref(), self.profile.default_file_name);
+            let mime = get_prop(data, "mime")
+                .or_else(|| get_prop(data, "mimeType"))
+                .or_else(|| get_prop(data, "contentType"))
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| infer_mime_from_name(&name).to_string());
+            let Some(bytes) = extract_bytes(data) else {
+                return json!({
+                    "ok": false,
+                    "error": "missing file bytes, base64, dataUrl, or text payload"
+                });
+            };
+            if (bytes.len() as u64) > MAX_OPEN_BYTES {
+                return json!({
+                    "ok": false,
+                    "error": format!("file exceeds {} MiB host open limit", MAX_OPEN_BYTES >> 20)
+                });
+            }
+
+            // 1. Stage in DOM (<input type="file"> & showOpenFilePicker redirector) AND dispatch DragEvent("drop") onto #<canvas_id>
+            stage_and_drop_file_in_dom(self.profile.canvas_id, &name, &mime, &bytes);
+
+            // 2. If app registered an open_cb, invoke it directly
+            let fonts = extract_fonts(data);
+            let mut handled_by_cb = false;
+            if let Some(cb) = self.open_cb.borrow_mut().as_mut() {
+                cb(name.clone(), bytes.clone(), fonts);
+                handled_by_cb = true;
+            }
+
+            if let Some(w) = self.waker.borrow().as_ref() {
+                w();
+            }
+            wake_canvas(self.profile.canvas_id, 1);
+
+            // 3. Also drive app-specific control-channel import/open commands when applicable
+            let app_id = self.profile.id;
+            if app_id == "gridcraft" {
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    let rows = parse_tabular_text_rows(text);
+                    if !rows.is_empty() {
+                        let num_rows = rows.len();
+                        let num_cols = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+                        let end_col = ((b'A' + ((num_cols.min(26) - 1) as u8)) as char).to_string();
+                        let range_str = format!("A1:{end_col}{num_rows}");
+                        let (m, p) = self.profile.methods.format_execute_params(
+                            "range.setValues",
+                            json!({ "range": range_str, "values": rows }),
+                        );
+                        let _ = self.call_control(&m, p).await;
+                    }
+                }
+            } else if app_id == "wordcraft" {
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    if !text.trim().is_empty() {
+                        let (m, p) = self
+                            .profile
+                            .methods
+                            .format_execute_params("text.insert", json!({ "text": text }));
+                        let _ = self.call_control(&m, p).await;
+                    }
+                }
+            } else if matches!(app_id, "designcraft" | "deckcraft") {
+                let b64 = base64_encode(&bytes);
+                let (m, p) = self
+                    .profile
+                    .methods
+                    .format_execute_params("file.openBytes", json!({ "name": name, "data": b64 }));
+                let _ = self.call_control(&m, p).await;
+            } else if app_id == "craft-anything" && !handled_by_cb {
+                let b64 = base64_encode(&bytes);
+                let (m, p) = self
+                    .profile
+                    .methods
+                    .format_execute_params("file.open", json!({ "name": name, "data": b64 }));
+                let _ = self.call_control(&m, p).await;
+            }
+
+            let rev = self.revision.borrow_mut().record_edit();
+            json!({
+                "ok": true,
+                "result": {
+                    "ok": true,
+                    "name": name,
+                    "mime": mime,
+                    "size": bytes.len(),
+                    "mode": if is_import { "import" } else { "open" },
+                    "revision": rev
+                }
+            })
         }
 
         /// Notify the host frame that startup or an operation failed.
@@ -1667,10 +2042,31 @@ pub mod web {
                 let pointer_fn = Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(move |params: JsValue| {
                     let b3 = b3.clone();
                     let p = js_to_json(&params);
-                    b3.cursor.borrow_mut().update_from_json(&p);
-                    sync_dom_cursor_overlay(b3.profile.canvas_id, &b3.cursor.borrow());
+                    let (rl, rt, rw, rh) = canvas_bounding_rect(b3.profile.canvas_id);
+                    let (scaled_p, dom_events) = scale_pointer_payload_for_canvas(&p, rl, rt, rw, rh);
+                    {
+                        let mut cur = b3.cursor.borrow_mut();
+                        cur.update_from_json(&p);
+                        if let Some(last_evt) = p.get("events").and_then(Value::as_array).and_then(|a| a.last()) {
+                            cur.update_from_json(last_evt);
+                        }
+                        sync_dom_cursor_overlay(b3.profile.canvas_id, &cur);
+                    }
+                    for (kind, cx, cy, btn) in &dom_events {
+                        synthesize_canvas_pointer_in_dom(b3.profile.canvas_id, kind, *cx, *cy, *btn);
+                    }
+                    if let Some(w) = b3.waker.borrow().as_ref() {
+                        w();
+                    }
                     let ptr_method = b3.profile.methods.pointer.unwrap_or("ui.pointer");
-                    future_to_promise(async move { reply_to_promise_outcome(&b3.call_control(ptr_method, p).await) })
+                    future_to_promise(async move {
+                        let reply = b3.call_control(ptr_method, scaled_p).await;
+                        if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+                            reply_to_promise_outcome(&reply)
+                        } else {
+                            Ok(json_to_js(&json!({ "ok": true, "dispatchedDomEvents": dom_events.len() })))
+                        }
+                    })
                 });
                 set_always("pointer", pointer_fn.into_js_value())?;
             }
@@ -1691,6 +2087,8 @@ pub mod web {
                     json_to_js(&json!({
                         "app": b2.profile.id,
                         "bridgeVersion": BRIDGE_ID,
+                        "ready": b2.app_ready.get(),
+                        "heldQueueCount": b2.held_queue.borrow().len(),
                         "dirty": rev.is_dirty(),
                         "revision": rev.current_revision,
                         "savedRevision": rev.saved_revision,
@@ -1698,6 +2096,53 @@ pub mod web {
                     }))
                 });
                 set_always("state", state_fn.into_js_value())?;
+
+                // 8. importFile(params), openFile(params), isReady(), waitReady(timeoutMs)
+                let b_imp = self.clone();
+                let import_fn = Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(move |params: JsValue| {
+                    let b_imp = b_imp.clone();
+                    future_to_promise(async move {
+                        let reply = b_imp.import_or_open_payload(&params, true).await;
+                        reply_to_promise_outcome(&reply)
+                    })
+                });
+                set_always("importFile", import_fn.into_js_value())?;
+
+                let b_opn = self.clone();
+                let open_fn = Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(move |params: JsValue| {
+                    let b_opn = b_opn.clone();
+                    future_to_promise(async move {
+                        let reply = b_opn.import_or_open_payload(&params, false).await;
+                        reply_to_promise_outcome(&reply)
+                    })
+                });
+                set_if_missing("openFile", open_fn.into_js_value())?;
+
+                let b_rdy = self.clone();
+                let is_ready_fn = Closure::<dyn FnMut() -> JsValue>::new(move || {
+                    JsValue::from_bool(b_rdy.app_ready.get())
+                });
+                set_always("isReady", is_ready_fn.into_js_value())?;
+
+                let b_wait = self.clone();
+                let wait_ready_fn = Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(move |timeout_val: JsValue| {
+                    let b_wait = b_wait.clone();
+                    let timeout_ms = timeout_val.as_f64().unwrap_or(20_000.0).clamp(100.0, 60_000.0);
+                    future_to_promise(async move {
+                        let mut elapsed = 0.0;
+                        while !b_wait.app_ready.get() && elapsed < timeout_ms {
+                            sleep_ms(30.0).await;
+                            elapsed += 30.0;
+                        }
+                        Ok(json_to_js(&json!({
+                            "ok": b_wait.app_ready.get(),
+                            "ready": b_wait.app_ready.get(),
+                            "app": b_wait.profile.id,
+                            "waitedMs": elapsed
+                        })))
+                    })
+                });
+                set_always("waitReady", wait_ready_fn.into_js_value())?;
             }
 
             define_window_global(&g, self.profile.js_global, &target);
@@ -1746,6 +2191,9 @@ pub mod web {
                     "hello",
                     "ping",
                     "open",
+                    "import",
+                    "insert",
+                    "place",
                     "save",
                     "saved",
                     "saveAck",
@@ -1779,48 +2227,106 @@ pub mod web {
         }
 
         fn handle_incoming(&self, kind: IncomingKind, data: JsValue) {
+            if !self.app_ready.get() {
+                if is_canvas_and_dom_ready(self.profile.id, self.profile.canvas_id) {
+                    self.app_ready.set(true);
+                    set_window_bridge_ready_flag(true);
+                    let ver = self.ready_version.borrow().clone();
+                    let _ = self.emit_ready_now(&ver, None);
+                    self.flush_held_queue();
+                } else {
+                    match kind {
+                        IncomingKind::Hello => {
+                            let held_len = self.held_queue.borrow().len() as f64;
+                            let _ = self.post_to_host(
+                                OutgoingKind::Loading,
+                                &[
+                                    ("ready", JsValue::from_bool(false)),
+                                    ("status", JsValue::from_str("loading")),
+                                    ("heldCount", JsValue::from_f64(held_len)),
+                                ],
+                                None,
+                            );
+                            return;
+                        }
+                        IncomingKind::Open
+                        | IncomingKind::Import
+                        | IncomingKind::Request
+                        | IncomingKind::Execute
+                        | IncomingKind::Pointer
+                        | IncomingKind::SnapshotRequest => {
+                            let mut q = self.held_queue.borrow_mut();
+                            q.push((kind, data));
+                            let held_len = q.len() as f64;
+                            drop(q);
+                            let _ = self.post_to_host(
+                                OutgoingKind::Loading,
+                                &[
+                                    ("ready", JsValue::from_bool(false)),
+                                    ("held", JsValue::from_bool(true)),
+                                    ("status", JsValue::from_str("loading_held")),
+                                    ("heldCount", JsValue::from_f64(held_len)),
+                                ],
+                                None,
+                            );
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.dispatch_ready_incoming(kind, data);
+        }
+
+        fn dispatch_ready_incoming(&self, kind: IncomingKind, data: JsValue) {
             let req_id = get_prop(&data, "requestId").or_else(|| get_prop(&data, "id"));
             match kind {
                 IncomingKind::Hello => {
-                    let _ = self.post_ready(env!("CARGO_PKG_VERSION"), None);
+                    let ver = self.ready_version.borrow().clone();
+                    let _ = self.post_ready(&ver, None);
                 }
-                IncomingKind::Open => {
-                    let raw_name = get_prop(&data, "name").and_then(|v| v.as_string());
-                    let name = sanitize_file_name(raw_name.as_deref(), self.profile.default_file_name);
-                    let Some(bytes) = extract_bytes(&data) else {
-                        let _ = self.post_to_host(
-                            OutgoingKind::OpenFailed,
-                            &[("error", "missing bytes or document ArrayBuffer".into())],
-                            None,
-                        );
-                        return;
-                    };
-                    if (bytes.len() as u64) > MAX_OPEN_BYTES {
-                        let _ = self.post_to_host(
-                            OutgoingKind::OpenFailed,
-                            &[(
-                                "error",
-                                format!("file exceeds {} MiB host open limit", MAX_OPEN_BYTES >> 20).into(),
-                            )],
-                            None,
-                        );
-                        return;
-                    }
-                    let fonts = extract_fonts(&data);
-                    if let Some(cb) = self.open_cb.borrow_mut().as_mut() {
-                        cb(name.clone(), bytes, fonts);
-                        let rev = self.revision.borrow().current_revision;
+                IncomingKind::Open | IncomingKind::Import => {
+                    let is_import = kind == IncomingKind::Import;
+                    let b = self.clone();
+                    spawn_local(async move {
+                        let reply = b.import_or_open_payload(&data, is_import).await;
+                        let ok = reply.get("ok").and_then(Value::as_bool) == Some(true);
+                        if !ok {
+                            let err_msg = reply
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("failed to import/open file");
+                            let mut fields = vec![("error", JsValue::from_str(err_msg)), ("ok", JsValue::from_bool(false))];
+                            if let Some(id) = req_id.filter(|v| !v.is_undefined()) {
+                                fields.push(("requestId", id));
+                            }
+                            let _ = b.post_to_host(OutgoingKind::OpenFailed, &fields, None);
+                            return;
+                        }
+                        let res_obj = reply.get("result").cloned().unwrap_or_else(|| json!({}));
+                        let name = res_obj.get("name").and_then(Value::as_str).unwrap_or("imported");
+                        let mime = res_obj.get("mime").and_then(Value::as_str).unwrap_or("application/octet-stream");
+                        let size = res_obj.get("size").and_then(Value::as_u64).unwrap_or(0) as f64;
+                        let rev = res_obj.get("revision").and_then(Value::as_u64).unwrap_or(1) as f64;
                         let mut fields = vec![
-                            ("name", JsValue::from_str(&name)),
+                            ("name", JsValue::from_str(name)),
+                            ("mime", JsValue::from_str(mime)),
+                            ("size", JsValue::from_f64(size)),
                             ("ok", JsValue::from_bool(true)),
                             ("warnings", js_sys::Array::new().into()),
-                            ("revision", JsValue::from_f64(rev as f64)),
+                            ("revision", JsValue::from_f64(rev)),
                         ];
-                        if let Some(id) = req_id.filter(|v| !v.is_undefined()) {
+                        if let Some(id) = req_id.clone().filter(|v| !v.is_undefined()) {
                             fields.push(("requestId", id));
                         }
-                        let _ = self.post_to_host(OutgoingKind::Opened, &fields, None);
-                    }
+                        let _ = b.post_to_host(OutgoingKind::Opened, &fields, None);
+                        if is_import {
+                            let _ = b.post_to_host(OutgoingKind::Imported, &fields, None);
+                        }
+                        if req_id.is_some() {
+                            b.post_control_response(req_id, if is_import { "file.import" } else { "file.open" }, &reply);
+                        }
+                    });
                 }
                 IncomingKind::Save | IncomingKind::Export => {
                     let fmt = get_prop(&data, "format").and_then(|v| v.as_string());
@@ -1930,6 +2436,8 @@ pub mod web {
                 }
                 IncomingKind::Pointer => {
                     let json_val = js_to_json(&data);
+                    let (rl, rt, rw, rh) = canvas_bounding_rect(self.profile.canvas_id);
+                    let (scaled_val, dom_events) = scale_pointer_payload_for_canvas(&json_val, rl, rt, rw, rh);
                     {
                         let mut cur = self.cursor.borrow_mut();
                         cur.update_from_json(&json_val);
@@ -1938,10 +2446,23 @@ pub mod web {
                         }
                         sync_dom_cursor_overlay(self.profile.canvas_id, &cur);
                     }
+                    for (kind, cx, cy, btn) in &dom_events {
+                        synthesize_canvas_pointer_in_dom(self.profile.canvas_id, kind, *cx, *cy, *btn);
+                    }
+                    if let Some(w) = self.waker.borrow().as_ref() {
+                        w();
+                    }
                     let ptr_method = self.profile.methods.pointer.unwrap_or("ui.pointer");
                     let b = self.clone();
+                    let dom_count = dom_events.len();
                     spawn_local(async move {
-                        let reply = b.call_control(ptr_method, json_val).await;
+                        let mut reply = b.call_control(ptr_method, scaled_val).await;
+                        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+                            reply = json!({
+                                "ok": true,
+                                "result": { "dispatchedDomEvents": dom_count }
+                            });
+                        }
                         b.post_control_response(req_id, ptr_method, &reply);
                     });
                 }
@@ -2222,13 +2743,39 @@ pub mod web {
     }
 
     fn extract_bytes(data: &JsValue) -> Option<Vec<u8>> {
-        for field in ["bytes", "document", "data"] {
+        for field in ["bytes", "document", "data", "buffer"] {
             if let Some(val) = get_prop(data, field) {
                 if let Some(arr) = val.dyn_ref::<js_sys::Uint8Array>() {
                     return Some(arr.to_vec());
                 }
                 if val.is_instance_of::<js_sys::ArrayBuffer>() {
                     return Some(js_sys::Uint8Array::new(&val).to_vec());
+                }
+            }
+        }
+        for field in ["base64", "bytes_b64", "dataUrl", "data_url", "data"] {
+            if let Some(s) = get_prop(data, field).and_then(|v| v.as_string()) {
+                let trimmed = s.trim();
+                if let Some((_, b64_part)) = trimmed.split_once(";base64,") {
+                    if let Some(decoded) = base64_decode(b64_part) {
+                        return Some(decoded);
+                    }
+                } else if !trimmed.is_empty()
+                    && trimmed.len() >= 4
+                    && trimmed
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_' | '\r' | '\n'))
+                    && let Some(decoded) = base64_decode(trimmed)
+                    && !decoded.is_empty()
+                {
+                    return Some(decoded);
+                }
+            }
+        }
+        for field in ["text", "content", "csv", "svg", "json", "data"] {
+            if let Some(s) = get_prop(data, field).and_then(|v| v.as_string()) {
+                if !s.is_empty() {
+                    return Some(s.into_bytes());
                 }
             }
         }
@@ -2289,16 +2836,11 @@ pub mod web {
             let _ = js_sys::Reflect::set(&style, &JsValue::from_str("display"), &JsValue::from_str("none"));
             return;
         }
-        let left = if cursor.normalized {
-            format!("{:.2}%", cursor.x.clamp(0.0, 1.0) * 100.0)
-        } else {
-            format!("{:.1}px", cursor.x)
-        };
-        let top = if cursor.normalized {
-            format!("{:.2}%", cursor.y.clamp(0.0, 1.0) * 100.0)
-        } else {
-            format!("{:.1}px", cursor.y)
-        };
+        let (rl, rt, rw, rh) = canvas_bounding_rect(canvas_id);
+        let (_, _, _, _, client_x, client_y) =
+            resolve_canvas_point(cursor.x, cursor.y, Some(cursor.normalized), rl, rt, rw, rh);
+        let left = format!("{client_x:.1}px");
+        let top = format!("{client_y:.1}px");
         let css = format!(
             "position:fixed;left:{left};top:{top};width:16px;height:16px;margin-left:-8px;margin-top:-8px;             border:2px solid {color};border-radius:50%;pointer-events:none;z-index:2147483647;             box-sizing:border-box;display:block;box-shadow:0 0 6px rgba(0,0,0,0.65);",
             color = cursor.color
@@ -2307,8 +2849,26 @@ pub mod web {
         let _ = js_sys::Reflect::set(&el, &JsValue::from_str("title"), &JsValue::from_str(&cursor.label));
     }
 
-    /// Fallback direct canvas PNG capture via `HTMLCanvasElement.toDataURL("image/png")`.
-    fn capture_canvas_png_base64(canvas_id: &str, _include_cursor: bool, _cursor: &CursorState) -> Option<(u32, u32, String)> {
+    /// Direct canvas PNG capture via offscreen 2D compositing (or `HTMLCanvasElement.toDataURL("image/png")`),
+    /// preserving the rendered WebGL/2D buffer and compositing the shared agent cursor when requested.
+    fn capture_canvas_png_base64(canvas_id: &str, include_cursor: bool, cursor: &CursorState) -> Option<(u32, u32, String)> {
+        let g: JsValue = js_sys::global().into();
+        if let Some(comp_fn) = get_prop(&g, "__craftCompositeCanvasSnapshot").filter(|v| v.is_function()) {
+            let comp_fn: js_sys::Function = comp_fn.unchecked_into();
+            let cur_js = json_to_js(&serde_json::to_value(cursor).unwrap_or(Value::Null));
+            if let Ok(res) = comp_fn.call3(
+                &g,
+                &JsValue::from_str(canvas_id),
+                &JsValue::from_bool(include_cursor),
+                &cur_js,
+            ) {
+                let w = get_prop(&res, "width").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+                let h = get_prop(&res, "height").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+                if let Some(b64) = get_prop(&res, "data").and_then(|v| v.as_string()).filter(|s| !s.is_empty()) {
+                    return Some((w.max(1), h.max(1), b64));
+                }
+            }
+        }
         let canvas = find_canvas(canvas_id)?;
         let w = get_prop(&canvas, "width").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
         let h = get_prop(&canvas, "height").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
@@ -2319,6 +2879,308 @@ pub mod web {
             .as_string()?;
         let b64 = data_url.strip_prefix("data:image/png;base64,")?.to_string();
         Some((w, h, b64))
+    }
+
+    fn canvas_bounding_rect(canvas_id: &str) -> (f64, f64, f64, f64) {
+        let Some(canvas) = find_canvas(canvas_id) else {
+            return (0.0, 0.0, 1024.0, 720.0);
+        };
+        if let Some(rect_fn) = get_prop(&canvas, "getBoundingClientRect").filter(|v| v.is_function()) {
+            let rect_fn: js_sys::Function = rect_fn.unchecked_into();
+            if let Ok(rect) = rect_fn.call0(&canvas) {
+                let left = get_prop(&rect, "left").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let top = get_prop(&rect, "top").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let width = get_prop(&rect, "width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let height = get_prop(&rect, "height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if width > 10.0 && height > 10.0 {
+                    return (left, top, width, height);
+                }
+            }
+        }
+        let w = get_prop(&canvas, "clientWidth")
+            .and_then(|v| v.as_f64())
+            .filter(|n| *n > 10.0)
+            .or_else(|| get_prop(&canvas, "width").and_then(|v| v.as_f64()))
+            .unwrap_or(1024.0);
+        let h = get_prop(&canvas, "clientHeight")
+            .and_then(|v| v.as_f64())
+            .filter(|n| *n > 10.0)
+            .or_else(|| get_prop(&canvas, "height").and_then(|v| v.as_f64()))
+            .unwrap_or(720.0);
+        (0.0, 0.0, w.max(1.0), h.max(1.0))
+    }
+
+    fn is_canvas_and_dom_ready(app_id: &str, canvas_id: &str) -> bool {
+        let Some(canvas) = find_canvas(canvas_id) else {
+            return false;
+        };
+        let cw = get_prop(&canvas, "width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let ch = get_prop(&canvas, "height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if cw < 64.0 || ch < 64.0 {
+            return false;
+        }
+        let Some(doc) = get_prop(&js_sys::global().into(), "document") else {
+            return true;
+        };
+        let Some(get_el) = get_prop(&doc, "getElementById").and_then(|v| v.dyn_into::<js_sys::Function>().ok()) else {
+            return true;
+        };
+        for lid in [format!("{app_id}_loading"), "loading".to_string()] {
+            if let Ok(el) = get_el.call1(&doc, &JsValue::from_str(&lid))
+                && !el.is_null()
+                && !el.is_undefined()
+            {
+                let hidden = get_prop(&el, "style")
+                    .and_then(|s| get_prop(&s, "display"))
+                    .and_then(|d| d.as_string())
+                    .is_some_and(|d| d == "none");
+                if !hidden {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn set_window_bridge_ready_flag(ready: bool) {
+        let g: JsValue = js_sys::global().into();
+        let _ = js_sys::Reflect::set(&g, &JsValue::from_str("__craftBridgeReady"), &JsValue::from_bool(ready));
+    }
+
+    fn drain_window_preboot_queue(app_id: &str) -> Vec<(IncomingKind, JsValue)> {
+        let g: JsValue = js_sys::global().into();
+        let Some(arr_val) = get_prop(&g, "__craftPreBootQueue").filter(|v| js_sys::Array::is_array(v)) else {
+            return Vec::new();
+        };
+        let arr = js_sys::Array::from(&arr_val);
+        let mut out = Vec::new();
+        while arr.length() > 0 {
+            let item = arr.shift();
+            let Some(msg_type) = get_prop(&item, "type").and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let has_marker = get_prop(&item, "bridge").and_then(|v| v.as_string()).as_deref() == Some(EMU_PROTOCOL_ID)
+                || get_prop(&item, "craftBridge").is_some_and(|v| !v.is_undefined())
+                || get_prop(&item, "photocraftEmbed").is_some_and(|v| !v.is_undefined())
+                || get_prop(&item, &format!("{app_id}Embed")).is_some_and(|v| !v.is_undefined());
+            if let Some(kind) = IncomingKind::parse(app_id, &msg_type, has_marker) {
+                out.push((kind, item));
+            }
+        }
+        out
+    }
+
+    fn install_dom_hooks(app_id: &str, canvas_id: &str) {
+        let script = r#"
+            if (!window.__craftDomHooksInstalled) {
+                window.__craftDomHooksInstalled = true;
+                window.__craftPendingImportFiles = window.__craftPendingImportFiles || [];
+                if (typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype.getContext) {
+                    const origGetCtx = HTMLCanvasElement.prototype.getContext;
+                    HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+                        if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') {
+                            attrs = Object.assign({}, attrs || {}, { preserveDrawingBuffer: true });
+                        }
+                        return origGetCtx.call(this, type, attrs);
+                    };
+                }
+                if (typeof HTMLInputElement !== 'undefined' && HTMLInputElement.prototype.click) {
+                    const origClick = HTMLInputElement.prototype.click;
+                    HTMLInputElement.prototype.click = function() {
+                        if (this && this.type === 'file' && window.__craftPendingImportFiles && window.__craftPendingImportFiles.length > 0) {
+                            const f = window.__craftPendingImportFiles.shift();
+                            window.__craftLastImportedFile = f;
+                            try {
+                                const dt = new DataTransfer();
+                                dt.items.add(f);
+                                this.files = dt.files;
+                                this.dispatchEvent(new Event('input', { bubbles: true }));
+                                this.dispatchEvent(new Event('change', { bubbles: true }));
+                                return;
+                            } catch (_) {}
+                        }
+                        return origClick.apply(this, arguments);
+                    };
+                }
+                const origShowOpen = window.showOpenFilePicker;
+                window.showOpenFilePicker = async function(opts) {
+                    if (window.__craftPendingImportFiles && window.__craftPendingImportFiles.length > 0) {
+                        const f = window.__craftPendingImportFiles.shift();
+                        window.__craftLastImportedFile = f;
+                        return [{
+                            kind: 'file',
+                            name: f.name,
+                            getFile: async () => f,
+                            queryPermission: async () => 'granted',
+                            requestPermission: async () => 'granted'
+                        }];
+                    }
+                    if (typeof origShowOpen === 'function') {
+                        return origShowOpen.apply(this, arguments);
+                    }
+                    throw new Error('No pending file in __craftPendingImportFiles');
+                };
+                window.__craftStageImportFile = function(canvasId, name, mime, uint8) {
+                    try {
+                        const file = new File([uint8], name || 'imported.bin', { type: mime || 'application/octet-stream', lastModified: Date.now() });
+                        window.__craftPendingImportFiles = window.__craftPendingImportFiles || [];
+                        window.__craftPendingImportFiles.push(file);
+                        window.__craftLastImportedFile = file;
+                        const canvas = document.getElementById(canvasId) || document.querySelector('canvas');
+                        if (canvas && typeof DataTransfer !== 'undefined' && typeof DragEvent !== 'undefined') {
+                            const dt = new DataTransfer();
+                            dt.items.add(file);
+                            const rect = canvas.getBoundingClientRect();
+                            const cx = rect.left + rect.width * 0.5;
+                            const cy = rect.top + rect.height * 0.5;
+                            for (const evType of ['dragenter', 'dragover', 'drop']) {
+                                const ev = new DragEvent(evType, {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    clientX: cx,
+                                    clientY: cy,
+                                    dataTransfer: dt
+                                });
+                                canvas.dispatchEvent(ev);
+                            }
+                        }
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+                window.__craftSynthesizeCanvasPointer = function(canvasId, kind, clientX, clientY, button) {
+                    try {
+                        const canvas = document.getElementById(canvasId) || document.querySelector('canvas');
+                        if (!canvas) return false;
+                        const btn = Number(button) || 0;
+                        const isDown = kind === 'down' || kind === 'pointerdown' || kind === 'mousedown';
+                        const isUp = kind === 'up' || kind === 'pointerup' || kind === 'mouseup';
+                        const isClick = kind === 'click';
+                        const buttons = isDown ? (1 << btn) : 0;
+                        const baseInit = {
+                            bubbles: true,
+                            cancelable: true,
+                            composed: true,
+                            view: window,
+                            clientX: Number(clientX) || 0,
+                            clientY: Number(clientY) || 0,
+                            screenX: Number(clientX) || 0,
+                            screenY: Number(clientY) || 0,
+                            button: btn,
+                            buttons: buttons,
+                            pointerId: 1,
+                            pointerType: 'mouse',
+                            isPrimary: true,
+                            width: 1,
+                            height: 1,
+                            pressure: isDown ? 0.5 : 0.0
+                        };
+                        if (kind === 'move' || kind === 'pointermove' || kind === 'mousemove') {
+                            if (typeof PointerEvent !== 'undefined') canvas.dispatchEvent(new PointerEvent('pointermove', baseInit));
+                            canvas.dispatchEvent(new MouseEvent('mousemove', baseInit));
+                        } else if (isDown) {
+                            try { if (typeof canvas.focus === 'function') canvas.focus({ preventScroll: true }); } catch (_) {}
+                            if (typeof PointerEvent !== 'undefined') {
+                                canvas.dispatchEvent(new PointerEvent('pointerover', baseInit));
+                                canvas.dispatchEvent(new PointerEvent('pointerenter', baseInit));
+                                canvas.dispatchEvent(new PointerEvent('pointermove', baseInit));
+                                canvas.dispatchEvent(new PointerEvent('pointerdown', baseInit));
+                            }
+                            canvas.dispatchEvent(new MouseEvent('mouseover', baseInit));
+                            canvas.dispatchEvent(new MouseEvent('mousemove', baseInit));
+                            canvas.dispatchEvent(new MouseEvent('mousedown', baseInit));
+                        } else if (isUp) {
+                            if (typeof PointerEvent !== 'undefined') canvas.dispatchEvent(new PointerEvent('pointerup', baseInit));
+                            canvas.dispatchEvent(new MouseEvent('mouseup', baseInit));
+                        } else if (isClick) {
+                            canvas.dispatchEvent(new MouseEvent('click', Object.assign({}, baseInit, { detail: 1 })));
+                        }
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+                window.__craftCompositeCanvasSnapshot = function(canvasId, includeCursor, cursor) {
+                    try {
+                        const canvas = document.getElementById(canvasId) || document.querySelector('canvas');
+                        if (!canvas) return null;
+                        const w = Math.max(1, canvas.width || canvas.clientWidth || 1024);
+                        const h = Math.max(1, canvas.height || canvas.clientHeight || 720);
+                        const off = document.createElement('canvas');
+                        off.width = w;
+                        off.height = h;
+                        const ctx = off.getContext('2d');
+                        if (!ctx) return null;
+                        ctx.drawImage(canvas, 0, 0, w, h);
+                        if (includeCursor && cursor && cursor.visible) {
+                            const nx = cursor.normalized ? Math.max(0, Math.min(1, Number(cursor.x) || 0.5)) : Math.max(0, Math.min(1, (Number(cursor.x) || 0) / w));
+                            const ny = cursor.normalized ? Math.max(0, Math.min(1, Number(cursor.y) || 0.5)) : Math.max(0, Math.min(1, (Number(cursor.y) || 0) / h));
+                            const cx = nx * w;
+                            const cy = ny * h;
+                            const col = cursor.color || '#38bdf8';
+                            ctx.save();
+                            ctx.strokeStyle = col;
+                            ctx.lineWidth = 2.5;
+                            ctx.beginPath();
+                            ctx.arc(cx, cy, cursor.pressed ? 10 : 8, 0, Math.PI * 2);
+                            ctx.stroke();
+                            ctx.fillStyle = col;
+                            ctx.beginPath();
+                            ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.restore();
+                        }
+                        const dataUrl = off.toDataURL('image/png');
+                        const prefix = 'data:image/png;base64,';
+                        if (dataUrl && dataUrl.startsWith(prefix)) {
+                            return { width: w, height: h, data: dataUrl.slice(prefix.length) };
+                        }
+                        return null;
+                    } catch (_) {
+                        return null;
+                    }
+                };
+            }
+        "#;
+        let f = js_sys::Function::new_with_args("appId,canvasId", script);
+        let _ = f.call2(
+            &js_sys::global(),
+            &JsValue::from_str(app_id),
+            &JsValue::from_str(canvas_id),
+        );
+    }
+
+    fn stage_and_drop_file_in_dom(canvas_id: &str, name: &str, mime: &str, bytes: &[u8]) {
+        let g: JsValue = js_sys::global().into();
+        let Some(f) = get_prop(&g, "__craftStageImportFile").filter(|v| v.is_function()) else {
+            return;
+        };
+        let f: js_sys::Function = f.unchecked_into();
+        let u8_arr = js_sys::Uint8Array::from(bytes);
+        let _ = f.call4(
+            &g,
+            &JsValue::from_str(canvas_id),
+            &JsValue::from_str(name),
+            &JsValue::from_str(mime),
+            &u8_arr.into(),
+        );
+    }
+
+    fn synthesize_canvas_pointer_in_dom(canvas_id: &str, kind: &str, client_x: f64, client_y: f64, button: i16) {
+        let g: JsValue = js_sys::global().into();
+        let Some(f) = get_prop(&g, "__craftSynthesizeCanvasPointer").filter(|v| v.is_function()) else {
+            return;
+        };
+        let f: js_sys::Function = f.unchecked_into();
+        let argv = js_sys::Array::of5(
+            &JsValue::from_str(canvas_id),
+            &JsValue::from_str(kind),
+            &JsValue::from_f64(client_x),
+            &JsValue::from_f64(client_y),
+            &JsValue::from_f64(f64::from(button)),
+        );
+        let _ = js_sys::Reflect::apply(&f, &g, &argv);
     }
 
     /// Call `HTMLCanvasElement.prototype.captureStream(fps)` on the app's primary canvas element.
@@ -2514,5 +3376,46 @@ mod tests {
         let encoded = base64_encode(sample);
         let decoded = base64_decode(&encoded).unwrap_or_default();
         assert_eq!(decoded, sample);
+    }
+
+    #[test]
+    fn import_message_and_pointer_scaling_and_table_parsing_work() {
+        assert_eq!(
+            IncomingKind::parse("gridcraft", "gridcraft:import", false),
+            Some(IncomingKind::Import)
+        );
+        assert_eq!(
+            IncomingKind::parse("photocraft", "photocraft:insert", false),
+            Some(IncomingKind::Import)
+        );
+        assert_eq!(
+            IncomingKind::parse("gridcraft", "gridcraft:ready-request", false),
+            Some(IncomingKind::Hello)
+        );
+        assert_eq!(infer_mime_from_name("slip.csv"), "text/csv");
+        assert_eq!(infer_mime_from_name("hero.png"), "image/png");
+
+        let rows = parse_tabular_text_rows("Market,Side,Stake\nBTC > 100k,YES,$50");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["Market", "Side", "Stake"]);
+        assert_eq!(rows[1], vec!["BTC > 100k", "YES", "$50"]);
+
+        let ptr_in = json!({
+            "x": 0.5,
+            "y": 0.25,
+            "normalized": true,
+            "events": [
+                { "type": "move", "x": 0.5, "y": 0.25 },
+                { "type": "down", "x": 0.5, "y": 0.25, "button": 0 },
+                { "type": "up", "x": 0.5, "y": 0.25, "button": 0 }
+            ]
+        });
+        let (scaled, dom_evts) = scale_pointer_payload_for_canvas(&ptr_in, 10.0, 20.0, 1000.0, 800.0);
+        assert_eq!(scaled["x"], json!(500.0));
+        assert_eq!(scaled["y"], json!(200.0));
+        assert_eq!(scaled["clientX"], json!(510.0));
+        assert_eq!(scaled["clientY"], json!(220.0));
+        assert_eq!(dom_evts.len(), 4); // move, down, up, click
+        assert_eq!(dom_evts[3].0, "click");
     }
 }

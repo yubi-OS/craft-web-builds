@@ -235,6 +235,12 @@ elif app_id == "designcraft" and os.path.exists(web_rs):
                         rx
                     });
                     ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
+                    let open_inbox = inbox.clone();
+                    let open_ctx = cc.egui_ctx.clone();
+                    ubridge.on_open(move |name, bytes, _fonts| {
+                        open_inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                        open_ctx.request_repaint();
+                    });
                     let mut svc = services(inbox.clone(), cc.egui_ctx.clone());
                     if ubridge.mode.is_some() {
                         let sb1 = ubridge.clone();
@@ -449,5 +455,80 @@ if os.path.exists(pkg_sh):
         ps = ps.replace("25165824", "33554432")
         with open(pkg_sh, "w", encoding="utf-8") as f:
             f.write(ps)
+
+
+# Inject early pre-boot bridge script into index.html templates so preserveDrawingBuffer:true,
+# file-import <input type="file"> redirection, and pre-WASM postMessage load-hold queue are active from ms 0.
+PREBOOT_SCRIPT = f"""<script id="craft-universal-preboot">
+(function(){{
+  var APP_ID = "{app_id}";
+  window.__craftBridgeReady = false;
+  window.__craftPreBootQueue = window.__craftPreBootQueue || [];
+  window.__craftPendingImportFiles = window.__craftPendingImportFiles || [];
+  if (typeof HTMLCanvasElement !== "undefined" && HTMLCanvasElement.prototype.getContext) {{
+    var _origGetCtx = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, attrs) {{
+      if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {{
+        attrs = Object.assign({{}}, attrs || {{}}, {{ preserveDrawingBuffer: true }});
+      }}
+      return _origGetCtx.call(this, type, attrs);
+    }};
+  }}
+  window.addEventListener("message", function(ev) {{
+    if (window.__craftBridgeReady) return;
+    if (!ev || !ev.data || typeof ev.data !== "object") return;
+    var t = String(ev.data.type || "");
+    if (!t.startsWith(APP_ID + ":") && !t.startsWith("craft:")) return;
+    var suffix = t.slice(t.indexOf(":") + 1);
+    if (suffix === "host" || suffix === "hello" || suffix === "ping" || suffix === "ready-request" || suffix === "readyRequest") {{
+      try {{
+        if (window.parent && window.parent !== window) {{
+          window.parent.postMessage({{
+            type: APP_ID + ":loading",
+            kind: "loading",
+            app: APP_ID,
+            craftBridge: "universal/1",
+            ready: false,
+            stage: "wasm_loading",
+            heldCount: window.__craftPreBootQueue.length
+          }}, ev.origin || location.origin);
+        }}
+      }} catch (_) {{}}
+      return;
+    }}
+    window.__craftPreBootQueue.push(ev.data);
+    try {{
+      if (window.parent && window.parent !== window) {{
+        window.parent.postMessage({{
+          type: APP_ID + ":loading",
+          kind: "loading",
+          app: APP_ID,
+          craftBridge: "universal/1",
+          ready: false,
+          held: true,
+          stage: "wasm_loading",
+          heldCount: window.__craftPreBootQueue.length
+        }}, ev.origin || location.origin);
+      }}
+    }} catch (_) {{}}
+  }});
+}})();
+</script>"""
+
+for root_dir, _, files in os.walk(app_root):
+    if "target" in root_dir.split(os.sep) or ".git" in root_dir.split(os.sep):
+        continue
+    for fn in files:
+        if fn == "index.html":
+            hp = os.path.join(root_dir, fn)
+            try:
+                with open(hp, "r", encoding="utf-8") as hf:
+                    htxt = hf.read()
+                if 'id="craft-universal-preboot"' not in htxt and "<head>" in htxt:
+                    htxt = htxt.replace("<head>", "<head>\n" + PREBOOT_SCRIPT, 1)
+                    with open(hp, "w", encoding="utf-8") as hf:
+                        hf.write(htxt)
+            except Exception:
+                pass
 
 print(f"Wired universal_bridge into {app_id}-web")

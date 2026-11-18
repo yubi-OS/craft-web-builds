@@ -286,13 +286,17 @@ for (const slug of APPS) {
       // 4. Snapshot Frame Capture via postMessage
       const snapResp = await window.req({ type: `${s}:snapshot-request`, requestId: 's1', includeCursor: true }, 15000);
 
-      // 5. captureStream & saveAck
+      // 5. captureStream, saveAck, isReady & importFile
       const streamTracks = w[s].captureStream(15)?.getVideoTracks()?.length || 0;
       const ackOk = Boolean(w[s].saveAck(1));
+      const readyOk = typeof w[s].isReady === 'function' ? Boolean(w[s].isReady()) : false;
+      const importFileFnOk = typeof w[s].importFile === 'function';
 
       return {
         app: s,
         globalIsCanvas,
+        readyOk,
+        importFileFnOk,
         commandsOk: Boolean(cmdResp.ok),
         commandsCount: list.length,
         webMcpSchemas: schemas,
