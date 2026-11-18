@@ -235,12 +235,6 @@ elif app_id == "designcraft" and os.path.exists(web_rs):
                         rx
                     });
                     ubridge.set_waker({ let c = cc.egui_ctx.clone(); move || c.request_repaint() });
-                    let open_inbox = inbox.clone();
-                    let open_ctx = cc.egui_ctx.clone();
-                    ubridge.on_open(move |name, bytes, _fonts| {
-                        open_inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
-                        open_ctx.request_repaint();
-                    });
                     let mut svc = services(inbox.clone(), cc.egui_ctx.clone());
                     if ubridge.mode.is_some() {
                         let sb1 = ubridge.clone();
@@ -451,8 +445,8 @@ pkg_sh = os.path.join(app_root, "packaging", "web", "package.sh")
 if os.path.exists(pkg_sh):
     with open(pkg_sh, "r", encoding="utf-8") as f:
         ps = f.read()
-    if "25165824" in ps:
-        ps = ps.replace("25165824", "33554432")
+    if "25165824" in ps or "26214400" in ps:
+        ps = ps.replace("25165824", "33554432").replace("26214400", "33554432")
         with open(pkg_sh, "w", encoding="utf-8") as f:
             f.write(ps)
 

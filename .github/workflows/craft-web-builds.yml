@@ -125,7 +125,7 @@ jobs:
       max-parallel: 4
       matrix:
         app:
-          - { id: photocraft,     repo: photocraft,     web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
+          - { id: photocraft,     repo: photocraft,     app_ref: "aae9b7ea61195eba0c43877d59654aefdc7c5576", web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
           - { id: vectorcraft,    repo: vectorcraft,    web_fonts: true,  craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
           - { id: lightcraft,     repo: lightcraft,     web_fonts: true,  craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
           - { id: pdfcraft,       repo: pdfcraft,       web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
@@ -134,7 +134,7 @@ jobs:
           - { id: figcraft,       repo: figcraft,       web_fonts: true,  craft_fonts_ref: "37827adc41fd165f9a9234ac40f94dbad353aa69" }
           - { id: filmcraft,      repo: filmcraft,      web_fonts: false, craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
           - { id: texturecraft,   repo: texturecraft,   web_fonts: true,  craft_fonts_ref: "aced4137c022f1f587624d48e81ec77e1914a9cc" }
-          - { id: materialcraft,  repo: materialcraft,  web_fonts: true,  craft_fonts_ref: "3d9ab3a132ed0eff457e424226a435a901da30d3" }
+          - { id: materialcraft,  repo: materialcraft,  app_ref: "7019d44f95caffa12b603b7679605fbb3ccb82e5", web_fonts: true,  craft_fonts_ref: "3d9ab3a132ed0eff457e424226a435a901da30d3" }
           - { id: wordcraft,      repo: wordcraft,      web_fonts: true,  craft_fonts_ref: "b076417b5880bd4154bd22f00695b1d28c6bea83" }
           - { id: soundcraft,     repo: soundcraft,     web_fonts: false, craft_fonts_ref: "bfcbf714e45a3ea8e98f88ab2b7971372a576414" }
           - { id: deckcraft,      repo: deckcraft,      web_fonts: false, craft_fonts_ref: "37827adc41fd165f9a9234ac40f94dbad353aa69" }
@@ -159,7 +159,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: storytold/${{ matrix.app.repo }}
-          ref: main
+          ref: ${{ matrix.app.app_ref || 'main' }}
           fetch-depth: 1
 
       - name: Check out craft-i18n when craft-i18n.rev is present
